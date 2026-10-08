@@ -199,6 +199,7 @@ tbody tr:last-child td{border-bottom:none}
 .login-box input{width:100%;padding:11px 14px;border:1px solid var(--c-border);border-radius:var(--radius-sm);font-size:14px;transition:border-color var(--transition),box-shadow var(--transition)}
 .login-box input:focus{outline:none;border-color:var(--c-primary);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
 .login-box .btn{width:100%;padding:12px;font-size:14px;margin-top:6px;border-radius:10px}
+.hint{font-size:12px;color:var(--c-text-lighter);line-height:1.6}
 .login-box .hint{text-align:center;margin-top:18px;font-size:12px;color:var(--c-text-lighter)}
 .login-error{color:var(--c-danger);font-size:13px;text-align:center;margin-bottom:12px;display:none;background:#fef2f2;padding:8px;border-radius:8px}
 .login-footer{position:absolute;bottom:22px;left:0;right:0;text-align:center;font-size:12px;color:rgba(255,255,255,.5);letter-spacing:.8px;z-index:1}
@@ -315,3 +316,9 @@ td.actions-cell .btn{margin:2px 0}
 /* LLM 测试双列小表单 */
 .llm-row{display:grid;grid-template-columns:2fr 1fr;gap:12px}
 @media(max-width:640px){.llm-row{grid-template-columns:1fr}}
+
+/* 语言选择器（顶栏 + 登录页）：默认跟随系统语言，用户选择后记忆 */
+.lang-select{background:#fff;color:var(--c-text);border:1px solid var(--c-border);padding:5px 8px;border-radius:999px;cursor:pointer;font-size:12px;font-weight:600;transition:border-color var(--transition)}
+.lang-select:hover{border-color:var(--c-primary)}
+.lang-select:focus{outline:none;border-color:var(--c-primary);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+@media (max-width: 1500px){ .top-user .status-chip{display:none} }

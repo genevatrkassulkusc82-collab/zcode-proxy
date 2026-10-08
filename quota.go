@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"sort"
@@ -14,18 +15,18 @@ import (
 
 // ---- 额度查询与归一化 ----
 // 两个通道：
-//   jwt    → zcode.z.ai /api/v1/zcode-plan/billing/current（失败再试 /billing/balance）
-//   apikey → api.z.ai /api/monitor/usage/quota/limit + /api/biz/subscription/list
+//   jwt    → zcode.z.ai /api/v1/zcode-plan/billing/balance（current 已废弃仅兜底）
+//   apikey → api.z.ai /api/monitor/usage/quota/limit + /api/biz/subscription/list（Authorization 直传 Key）
 // 归一化逻辑移植 zcode-switch quota.rs（plans/balances 双结构 + 防御式字段别名）。
 
 const (
-	BillingBaseURL     = "https://zcode.z.ai/api/v1/zcode-plan"
-	SubscriptionURL    = "https://api.z.ai/api/biz/subscription/list"
-	QuotaLimitURL      = "https://api.z.ai/api/monitor/usage/quota/limit"
-	BillingPreviewURL  = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview"
-	BillingClaimURL    = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim"
-	EventReportURL     = "https://zcode.z.ai/api/v1/event/report"
-	ClientConfigsURL   = "https://zcode.z.ai/api/v1/client/configs"
+	BillingBaseURL    = "https://zcode.z.ai/api/v1/zcode-plan"
+	SubscriptionURL   = "https://api.z.ai/api/biz/subscription/list"
+	QuotaLimitURL     = "https://api.z.ai/api/monitor/usage/quota/limit"
+	BillingPreviewURL = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview"
+	BillingClaimURL   = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim"
+	EventReportURL    = "https://zcode.z.ai/api/v1/event/report"
+	ClientConfigsURL  = "https://zcode.z.ai/api/v1/client/configs"
 )
 
 // QuotaItem 单条额度切片
@@ -68,6 +69,27 @@ type QuotaOverview struct {
 	NotEntitled bool            `json:"not_entitled"` // 无 Coding Plan / 未激活
 	AuthFailed  bool            `json:"auth_failed"`  // 401/403 凭证失效
 	IsEmpty     bool            `json:"is_empty"`
+	NextReset   int64           `json:"next_reset,omitempty"` // 最早重置时间（unix 秒，monitor 通道）
+	Channels    []QuotaChannel  `json:"channels,omitempty"`   // 双通道额度构成（交叉核对时填充）
+}
+
+// QuotaChannel 单通道额度概要（F4：Start Plan 计费 vs coding plan monitor 并排可见）
+type QuotaChannel struct {
+	Source     string  `json:"source"`
+	PlanTier   string  `json:"plan_tier"`
+	Remaining  float64 `json:"remaining"`
+	Exhausted  bool    `json:"exhausted"`
+	AuthFailed bool    `json:"auth_failed"`
+	NextReset  int64   `json:"next_reset,omitempty"`
+}
+
+// channelSummary 从 overview 提取通道概要
+func channelSummary(ov *QuotaOverview) QuotaChannel {
+	c := QuotaChannel{Source: ov.Source, PlanTier: ov.PlanTier, Exhausted: ov.AllExhausted(), NextReset: ov.NextReset}
+	if ov.Remaining != nil {
+		c.Remaining = *ov.Remaining
+	}
+	return c
 }
 
 // quotaResult 内部：HTTP + 业务码 + 原始 JSON
@@ -77,8 +99,19 @@ type apiResponse struct {
 	RawText    string
 }
 
-// doGetJSON 带客户端身份头的 GET 请求
+// doGetJSON 带客户端身份头的 GET 请求（billing 端点：Bearer JWT）
 func (z *ZCodeAPI) doGetJSON(a *Account, urlStr string, extraHeaders map[string]string) (*apiResponse, error) {
+	token := z.billingToken(a)
+	if token == "" {
+		return nil, fmt.Errorf("账号缺少有效凭证")
+	}
+	return z.doGetJSONAuth(a, urlStr, "Bearer "+token, extraHeaders)
+}
+
+// doGetJSONAuth 同 doGetJSON，但显式指定完整 Authorization 头值。
+// monitor 端点（quota/limit、subscription/list）要求直传 API Key、不带 Bearer 前缀
+// （对齐 zai-org/ZCode createBigModelUsageHeaders）；authValue 为空时回退 billingToken。
+func (z *ZCodeAPI) doGetJSONAuth(a *Account, urlStr, authValue string, extraHeaders map[string]string) (*apiResponse, error) {
 	client := ClientForURL(z.egress.ProxyURLForAccount(a), urlStr, 25*time.Second)
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
@@ -88,12 +121,14 @@ func (z *ZCodeAPI) doGetJSON(a *Account, urlStr string, extraHeaders map[string]
 	for k, v := range ZaiClientHeaders(id) {
 		req.Header.Set(k, v)
 	}
-	// 认证：JWT 优先，API Key 通道同样以 Bearer 传递（monitor/subscription 端点语义）
-	token := z.billingToken(a)
-	if token == "" {
-		return nil, fmt.Errorf("账号缺少有效凭证")
+	if authValue == "" {
+		token := z.billingToken(a)
+		if token == "" {
+			return nil, fmt.Errorf("账号缺少有效凭证")
+		}
+		authValue = "Bearer " + token
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", authValue)
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
 	}
@@ -194,78 +229,108 @@ func unwrapData(v map[string]interface{}) map[string]interface{} {
 // ---- 主入口 ----
 
 // FetchQuotaRaw 拉取并归一化账号额度（不落库、不改状态）
+// 状态约定：纯网络失败/业务失败返回 err（调用方仅记日志，下轮重试）；
+// 仅当已应答通道全部返回 401/403 时返回 AuthFailed 结果（nil err），由状态机标记 invalid。
 func (z *ZCodeAPI) FetchQuotaRaw(a *Account) (*QuotaOverview, error) {
 	if a.ZCodeJWT != "" {
 		ov, err := z.fetchZaiBilling(a)
 		if err == nil {
+			// JWT 通道（Start Plan 计费）报耗尽而账号带 API Key 时交叉核对
+			// monitor 通道（individual coding plan 额度在彼处）：monitor 有余量
+			// 则以 monitor 为准，避免把可用的 coding plan 账号误标 exhausted
+			if ov != nil && ov.AllExhausted() && a.APIKey != "" {
+				if ov2, err2 := z.fetchApiZaiMonitor(a); err2 == nil && ov2 != nil &&
+					!ov2.AllExhausted() && !ov2.IsEmpty && !ov2.AuthFailed {
+					log.Printf("[quota] account %s: JWT billing exhausted but monitor channel has quota, using monitor", a.Email)
+					// F4：双通道额度构成并排入库（quota_json.channels）
+					ov2.Channels = append(ov2.Channels, channelSummary(ov), channelSummary(ov2))
+					return ov2, nil
+				}
+			}
 			return ov, nil
 		}
-		// JWT 通道鉴权失败且账号带 API Key 时回退 monitor 通道
-		if a.APIKey != "" && (ov == nil || ov.AuthFailed || isAuthErr(err)) {
-			return z.fetchApiZaiMonitor(a)
+		// 纯网络失败（超时/连接拒绝，无 HTTP 响应）：不回退、不改状态
+		if ov == nil || !ov.AuthFailed {
+			return nil, err
 		}
-		return nil, err
+		// JWT 通道明确 401/403 且账号带 API Key 时回退 monitor 通道
+		if a.APIKey != "" {
+			ov2, err2 := z.fetchApiZaiMonitor(a)
+			if err2 != nil && (ov2 == nil || !ov2.AuthFailed) {
+				// 回退通道网络/业务失败：单通道鉴权失败不定性，不改状态
+				return nil, err2
+			}
+			// 回退成功，或双通道均 401/403（AuthFailed → 状态机标记 invalid）
+			return ov2, nil
+		}
+		// 无回退通道：JWT 通道 401/403 即"已应答通道全部失败"，
+		// 必须按约定返回 AuthFailed + nil err，否则后台/手动刷新永远无法
+		// 把过期账号迁移到 invalid（或触发 refresh_token 兑换）
+		return &QuotaOverview{AuthFailed: true}, nil
 	}
 	if a.APIKey != "" {
-		return z.fetchApiZaiMonitor(a)
+		ov, err := z.fetchApiZaiMonitor(a)
+		if ov != nil && ov.AuthFailed {
+			// 唯一通道 401/403：同样定性为 AuthFailed（去 err 化，交状态机）。
+			// monitor 通道的 AuthFailed 一律伴随非 nil err，故这里不看 err。
+			return ov, nil
+		}
+		return ov, err
 	}
 	return nil, fmt.Errorf("账号缺少凭证")
 }
 
-func isAuthErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "401")
-}
-
-// fetchZaiBilling JWT 通道：billing/current → billing/balance
+// fetchZaiBilling JWT 通道：billing/balance（现行端点，官方客户端唯一在用）优先，
+// billing/current 已废弃仅兜底
 func (z *ZCodeAPI) fetchZaiBilling(a *Account) (*QuotaOverview, error) {
-	urlCurrent := fmt.Sprintf("%s/billing/current?app_version=%s", BillingBaseURL, z.appVersion)
-	resp, err := z.doGetJSON(a, urlCurrent, nil)
-	if err != nil {
-		return nil, err
+	urls := []string{
+		fmt.Sprintf("%s/billing/balance?app_version=%s", BillingBaseURL, z.appVersion),
+		fmt.Sprintf("%s/billing/current?app_version=%s", BillingBaseURL, z.appVersion),
 	}
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return &QuotaOverview{AuthFailed: true}, fmt.Errorf("HTTP %d 鉴权失败", resp.StatusCode)
-	}
-	if resp.Body != nil {
-		if code := jsonInt(resp.Body, "code"); code == 401 {
-			return &QuotaOverview{AuthFailed: true}, fmt.Errorf("业务码 401 令牌失效")
+	var primary, last *apiResponse
+	for i, u := range urls {
+		resp, err := z.doGetJSON(a, u, nil)
+		if err != nil {
+			return nil, err
 		}
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			return &QuotaOverview{AuthFailed: true}, fmt.Errorf("HTTP %d 鉴权失败", resp.StatusCode)
+		}
+		if resp.Body != nil {
+			if code := jsonInt(resp.Body, "code"); code == 401 {
+				return &QuotaOverview{AuthFailed: true}, fmt.Errorf("业务码 401 令牌失效")
+			}
+		}
+		if resp.StatusCode == 200 && businessOK(resp.Body) {
+			ov := normalizeBalanceResponse(resp.Body, "zcode.z.ai/billing")
+			ov.RefreshedAt = time.Now().Unix()
+			return ov, nil
+		}
+		if i == 0 {
+			primary = resp
+		}
+		last = resp
 	}
-	if resp.StatusCode == 200 && businessOK(resp.Body) {
-		ov := normalizeBalanceResponse(resp.Body, "zcode.z.ai/billing")
-		ov.RefreshedAt = time.Now().Unix()
-		return ov, nil
-	}
-	// current 失败 → balance 兜底
-	urlBalance := fmt.Sprintf("%s/billing/balance?app_version=%s", BillingBaseURL, z.appVersion)
-	resp2, err := z.doGetJSON(a, urlBalance, nil)
-	if err != nil {
-		return nil, err
-	}
-	if resp2.StatusCode == 401 || resp2.StatusCode == 403 {
-		return &QuotaOverview{AuthFailed: true}, fmt.Errorf("HTTP %d 鉴权失败", resp2.StatusCode)
-	}
-	if resp2.StatusCode == 200 && businessOK(resp2.Body) {
-		ov := normalizeBalanceResponse(resp2.Body, "zcode.z.ai/billing")
-		ov.RefreshedAt = time.Now().Unix()
-		return ov, nil
-	}
-	msg := extractErrMsg(resp2.Body)
+	msg := extractErrMsg(primary.Body)
 	if msg == "" {
-		msg = extractErrMsg(resp.Body)
+		msg = extractErrMsg(last.Body)
 	}
 	if strings.Contains(msg, "不存在coding plan") || strings.Contains(msg, "没有资格") {
 		return &QuotaOverview{NotEntitled: true, IsEmpty: true}, nil
 	}
 	if msg == "" {
-		msg = fmt.Sprintf("HTTP %d", resp2.StatusCode)
+		msg = fmt.Sprintf("HTTP %d", last.StatusCode)
 	}
 	return nil, fmt.Errorf("额度查询失败: %s", msg)
 }
 
 // fetchApiZaiMonitor API Key 通道：quota/limit + subscription/list
+// monitor 端点以 API Key 直传 Authorization（无 Bearer 前缀，对齐官方客户端）
 func (z *ZCodeAPI) fetchApiZaiMonitor(a *Account) (*QuotaOverview, error) {
-	resp, err := z.doGetJSON(a, QuotaLimitURL, nil)
+	if a.APIKey == "" {
+		return nil, fmt.Errorf("账号缺少 API Key")
+	}
+	resp, err := z.doGetJSONAuth(a, QuotaLimitURL, a.APIKey, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -284,13 +349,29 @@ func (z *ZCodeAPI) fetchApiZaiMonitor(a *Account) (*QuotaOverview, error) {
 		return nil, fmt.Errorf("额度查询失败: %s", msg)
 	}
 	var sub *map[string]interface{}
-	if subResp, err := z.doGetJSON(a, SubscriptionURL, nil); err == nil && businessOK(subResp.Body) {
+	if subResp, err := z.doGetJSONAuth(a, SubscriptionURL, a.APIKey, nil); err == nil && businessOK(subResp.Body) {
 		body := subResp.Body
 		sub = &body
 	}
 	ov := normalizeQuotaLimit(resp.Body, sub)
 	ov.Source = "api.z.ai/monitor"
 	ov.RefreshedAt = time.Now().Unix()
+	// F3：取各限额桶最早的 nextResetTime（毫秒 → unix 秒），供耗尽提示/未来调度
+	if d, ok := resp.Body["data"].(map[string]interface{}); ok {
+		if limits, ok := d["limits"].([]interface{}); ok {
+			for _, it := range limits {
+				lm, ok := it.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if n, ok := lm["nextResetTime"].(float64); ok && n > 0 {
+					if s := int64(n / 1000); ov.NextReset == 0 || s < ov.NextReset {
+						ov.NextReset = s
+					}
+				}
+			}
+		}
+	}
 	return ov, nil
 }
 
@@ -307,6 +388,55 @@ func extractErrMsg(v map[string]interface{}) string {
 }
 
 // ---- 归一化：billing/current & billing/balance（zcode.z.ai）----
+
+// upstreamLoc 上游墙钟时区：Z.ai 面向中国区，固定 UTC+8 无 DST。
+// 无时区字符串按此时区解释而非部署机本地时区——容器多为 UTC，差 8 小时会
+// 把"自然重置临近"误判成"远"，反向误烧稀缺重置槽
+var upstreamLoc = time.FixedZone("UTC+8", 8*3600)
+
+// resetAggFromItem 从额度项提取最早自然重置（unix 秒）。只认重置类键
+// （period_end/nextResetTime），不走 ExtractExpire 的优先级——那会把数月外的
+// 套餐/权益到期当成"下一次重置"，让阈值策略永远判"远"→ 永远花重置
+func resetAggFromItem(bm map[string]interface{}) int64 {
+	for _, k := range []string{"period_end", "nextResetTime", "next_reset_time"} {
+		v, ok := bm[k]
+		if !ok || v == nil {
+			continue
+		}
+		switch x := v.(type) {
+		case float64:
+			if x > 1e12 {
+				return int64(x / 1000)
+			}
+			if x > 1e9 {
+				return int64(x)
+			}
+		case string:
+			t := strings.TrimSpace(x)
+			if t == "" {
+				continue
+			}
+			if n, err := strconv.ParseFloat(t, 64); err == nil {
+				if n > 1e12 {
+					return int64(n / 1000)
+				}
+				if n > 1e9 {
+					return int64(n)
+				}
+			}
+			if ts, err := time.Parse(time.RFC3339, t); err == nil {
+				return ts.Unix()
+			}
+			t = strings.Replace(t, "T", " ", 1)
+			if len(t) >= 16 && t[4] == '-' && t[7] == '-' {
+				if ts, err := time.ParseInLocation("2006-01-02 15:04", t[:16], upstreamLoc); err == nil {
+					return ts.Unix()
+				}
+			}
+		}
+	}
+	return 0
+}
 
 func normalizeBalanceResponse(raw map[string]interface{}, source string) *QuotaOverview {
 	data := unwrapData(raw)
@@ -367,6 +497,14 @@ func normalizeBalanceResponse(raw map[string]interface{}, source string) *QuotaO
 				Remaining: jsonNum(bm, "remaining_units", "available_units", "remaining", "available"),
 				Unit:      firstNonEmpty(jsonStr(bm, "unit_type"), jsonStr(bm, "meter")),
 				PeriodEnd: ExtractExpire(bm),
+			}
+			// 聚合最早自然重置（unix 秒）：没有它，耗尽账号的 quota_json 恒无
+			// next_reset，auto-reset 的"等待超阈值才花重置"阈值策略对 JWT 账号
+			// 完全失明（永远按"未知=花"处理，阈值设置形同虚设）
+			if s := resetAggFromItem(bm); s > 0 && s > time.Now().Unix() {
+				if ov.NextReset == 0 || s < ov.NextReset {
+					ov.NextReset = s
+				}
 			}
 			if item.Name == "" {
 				item.Name = "额度"
@@ -735,6 +873,3 @@ func SortItemsByRemaining(items []QuotaItem) {
 		return ri > rj
 	})
 }
-
-// 保证 strconv 引用（防御未来删改）
-var _ = strconv.Itoa
