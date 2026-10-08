@@ -32,6 +32,13 @@ type FileConfig struct {
 	mu        sync.RWMutex
 }
 
+// ConfigDir 配置目录（-doctor 报告用）
+func (c *FileConfig) ConfigDir() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.configDir
+}
+
 // DefaultUpstream 与 zcode2api settings.py 一致的默认端点
 var DefaultUpstream = UpstreamURLs{
 	Zai:         "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
@@ -41,8 +48,7 @@ var DefaultUpstream = UpstreamURLs{
 
 // DefaultModels 默认模型清单（上游大小写敏感，这里存官方名）
 var DefaultModels = []string{
-	"GLM-5.3", "GLM-5.2", "GLM-5-Turbo", "GLM-4.7", "GLM-4.6",
-	"GLM-4.5", "GLM-4.5-Air", "GLM-4.5V", "GLM-4.5-Flash",
+	"GLM-5.3", "GLM-5.3-Flash",
 }
 
 // LoadFileConfig 加载配置目录；文件不存在时用默认值并落盘一份
@@ -123,15 +129,24 @@ func (c *FileConfig) writeDefaultLocked(path string) {
 }
 
 // StartHotReload 定时热加载
-func (c *FileConfig) StartHotReload(interval time.Duration) {
+// StartHotReload 返回停止函数：停机时调用，否则 ticker 与 goroutine 随进程存活
+func (c *FileConfig) StartHotReload(interval time.Duration) (stop func()) {
 	ticker := time.NewTicker(interval)
+	done := make(chan struct{})
 	go func() {
-		for range ticker.C {
-			if err := c.reload(); err != nil {
-				log.Printf("[config] hot reload failed: %v", err)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := c.reload(); err != nil {
+					log.Printf("[config] hot reload failed: %v", err)
+				}
 			}
 		}
 	}()
+	return func() { close(done) }
 }
 
 // GetListenAddr 线程安全读取
