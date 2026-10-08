@@ -1,10 +1,14 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -41,6 +45,7 @@ func (s *APIServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/check", s.auth.HandleCheckAuth)
 	mux.HandleFunc("POST /api/auth/password", s.auth.HandleChangePassword)
 	mux.HandleFunc("GET /api/settings/api-key", s.auth.HandleGetAPIKey)
+	mux.HandleFunc("POST /api/settings/api-key/reveal", s.auth.HandleRevealAPIKey)
 	mux.HandleFunc("POST /api/settings/api-key/generate", s.auth.HandleGenerateAPIKey)
 
 	// 仪表盘
@@ -55,6 +60,7 @@ func (s *APIServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/oauth/start", s.handleOAuthStart)
 	mux.HandleFunc("POST /api/accounts/oauth/manual", s.handleOAuthManual)
 	mux.HandleFunc("GET /api/accounts/oauth/status", s.handleOAuthStatus)
+	mux.HandleFunc("GET /api/offpeak/availability", s.handleOffpeakAvailability)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", s.handleAccountRefresh)
 	mux.HandleFunc("POST /api/accounts/{id}/claim", s.handleAccountClaim)
 	mux.HandleFunc("POST /api/accounts/{id}/detect", s.handleAccountDetect)
@@ -80,6 +86,12 @@ func (s *APIServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/claim-records", s.handleClaimRecords)
 	mux.HandleFunc("GET /api/usage-records", s.handleUsageRecords)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
+
+	// 下游网关 Key（R1）
+	mux.HandleFunc("GET /api/keys", s.handleListKeys)
+	mux.HandleFunc("POST /api/keys", s.handleCreateKey)
+	mux.HandleFunc("PUT /api/keys/{id}", s.handleUpdateKey)
+	mux.HandleFunc("DELETE /api/keys/{id}", s.handleDeleteKey)
 
 	// 设置
 	mux.HandleFunc("GET /api/settings", s.handleGetSettings)
@@ -130,7 +142,15 @@ func (s *APIServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		groupCount[g]++
 		totalRemaining += a.Remaining
 	}
-	stats, _ := s.db.UsageStats(7)
+	stats, statsErr := s.db.UsageStats(7)
+	if statsErr != nil {
+		// 部分分节失败不得洗成"零用量"：透传警示（UsageStats 已附 stats_errors
+		// 分节明细），前端可区分"没数据"与"查询失败"
+		log.Printf("[api] usage stats partial: %v", statsErr)
+		if stats != nil {
+			stats["stats_warning"] = statsErr.Error()
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"account_total":      len(accounts),
 		"account_selectable": s.pool.SelectableCount(""),
@@ -171,28 +191,42 @@ func accountPublicView(a *Account) map[string]interface{} {
 		"has_jwt": a.ZCodeJWT != "", "has_api_key": a.APIKey != "",
 		"has_access_token": a.AccessToken != "", "has_creds_snapshot": a.CredsRaw != "",
 		"device_mid": a.DeviceMid,
-		"status": EffectiveStatus(a), "raw_status": a.Status, "enabled": a.Enabled,
-		"group": a.AccountGroup, "remark": a.Remark,
+		"status":     EffectiveStatus(a), "raw_status": a.Status, "enabled": a.Enabled,
+		"group": a.AccountGroup, "remark": a.Remark, "priority": accountPriority(a),
 		"plan_tier": a.PlanTier, "plan_expire": a.PlanExpire,
 		"total_units": a.TotalUnits, "used_units": a.UsedUnits, "remaining": a.Remaining,
-		"quota":          quota,
-		"use_count":      a.UseCount,
-		"fail_count":     a.FailCount,
-		"last_used_at":   a.LastUsedAt,
-		"last_checked_at": a.LastCheckedAt,
-		"cooling_until":  a.CoolingUntil,
-		"last_error":     a.LastError,
-		"last_claim_at":  a.LastClaimAt, "last_claim_plan": a.LastClaimPlan, "last_claim_msg": a.LastClaimMsg,
+		"quota":              quota,
+		"use_count":          a.UseCount,
+		"fail_count":         a.FailCount,
+		"last_used_at":       a.LastUsedAt,
+		"last_checked_at":    a.LastCheckedAt,
+		"cooling_until":      a.CoolingUntil,
+		"last_error":         a.LastError,
+		"paid_fallback":      a.PaidFallback,
+		"paid_cooling_until": a.PaidCoolingUntil,
+		"paid_last_error":    a.PaidLastError,
+		"last_claim_at":      a.LastClaimAt, "last_claim_plan": a.LastClaimPlan, "last_claim_msg": a.LastClaimMsg,
 		"created_at": a.CreatedAt, "updated_at": a.UpdatedAt,
 	}
 }
 
 func (s *APIServer) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	group := r.URL.Query().Get("group")
-	accounts, err := s.db.ListAccounts(group)
+	accounts, err := s.db.ListAccounts("")
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// 组过滤走 matchAccountGroup：account_group 允许逗号分隔多组，SQL 精确等值
+	// 会漏掉 "eu,failover" 这类账号（转发/计划/闲时选择均按该语义）
+	if group != "" {
+		filtered := make([]*Account, 0, len(accounts))
+		for _, a := range accounts {
+			if matchAccountGroup(a, group) {
+				filtered = append(filtered, a)
+			}
+		}
+		accounts = filtered
 	}
 	out := make([]map[string]interface{}, 0, len(accounts))
 	for _, a := range accounts {
@@ -205,7 +239,11 @@ func (s *APIServer) handleImportLocal(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Group string `json:"group"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	// body 可选（group 默认空），但必须是合法 JSON：截断/畸形请求不得静默按空值导入
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 	a, err := s.acctMgr.ImportFromLocalClient(body.Group)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -233,16 +271,31 @@ func (s *APIServer) handleImportPaste(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "account": accountPublicView(a)})
 }
 
-// handleExportBundle 导出加密账号包
+// handleExportBundle 导出加密账号包（步进重认证：需再次提供当前管理口令）
 func (s *APIServer) handleExportBundle(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Password string  `json:"password"`
-		IDs      []int64 `json:"ids"`
+		Password      string  `json:"password"`
+		AdminPassword string  `json:"admin_password"`
+		IDs           []int64 `json:"ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	// 导出会带走全部凭据。独立限速键 ip|export（与登录的 ip|user 分开计数），
+	// 同样走指数退避：stolen session 无法无节流爆破管理员口令
+	rateKey := clientIP(r) + "|export"
+	if wait := s.auth.checkLoginRate(rateKey); wait > 0 {
+		writeAPIError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(wait.Seconds())+1))
+		return
+	}
+	if !s.auth.verifyPassword(body.AdminPassword) {
+		s.auth.recordLoginFail(rateKey)
+		writeAPIError(w, http.StatusUnauthorized, "管理员密码验证失败，请输入当前管理员密码")
+		return
+	}
+	s.auth.clearLoginFail(rateKey)
 	bundle, err := s.acctMgr.ExportBundle(body.Password, body.IDs)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -263,7 +316,10 @@ func (s *APIServer) handleImportBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	count, err := s.acctMgr.ImportBundle(body.Password, body.Bundle)
 	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, err.Error())
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false, "imported": count,
+			"error": map[string]string{"message": err.Error(), "type": "api_error"},
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "imported": count})
@@ -272,9 +328,27 @@ func (s *APIServer) handleImportBundle(w http.ResponseWriter, r *http.Request) {
 func (s *APIServer) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Manual bool   `json:"manual"`
+		Poll   bool   `json:"poll"` // 服务端中介轮询登录（免回调，免注册 redirect_uri）
 		Group  string `json:"group"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	// body 可选，但畸形 JSON 会把 poll 请求静默变成回调流程——必须报错
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if body.Poll {
+		flow, authURL, err := s.oauth.StartPollLogin(body.Group)
+		if err != nil {
+			writeAPIError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"state":         flow.State,
+			"authorize_url": authURL,
+			"poll":          true,
+		})
+		return
+	}
 	flow, authURL := s.oauth.StartLogin(body.Manual, body.Group)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"state":         flow.State,
@@ -309,6 +383,37 @@ func (s *APIServer) handleOAuthStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, flow)
 }
 
+// handleOffpeakAvailability 探闲时队列可用性（管理端，取第一个可用 JWT 账号）
+func (s *APIServer) handleOffpeakAvailability(w http.ResponseWriter, r *http.Request) {
+	accounts, err := s.db.ListAccounts("")
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	tickets := offPeakTickets{z: s.zapi}
+	lastErr := ""
+	for _, a := range accounts {
+		if !a.Enabled || a.ZCodeJWT == "" || a.Provider != "zai" {
+			continue
+		}
+		canTake, nextTakeAt, err := tickets.Availability(r.Context(), a)
+		if err != nil {
+			// 单个账号（如 JWT 过期）不应让整个队列显示不可用：继续探测下一个
+			lastErr = a.DisplayNameOrEmail() + ": " + err.Error()
+			continue
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"ok": true, "can_take": canTake, "next_take_at": nextTakeAt, "account": a.DisplayNameOrEmail(),
+		})
+		return
+	}
+	if lastErr != "" {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": "所有账号探测失败（" + truncate(lastErr, 300) + "）"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": "无可用 JWT 账号"})
+}
+
 func (s *APIServer) handleAccountRefresh(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -321,10 +426,25 @@ func (s *APIServer) handleAccountRefresh(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.zapi.RefreshAccountQuota(a); err != nil {
+		if errors.Is(err, errRefreshInFlight) {
+			// 已有并发刷新在跑：不算失败，返回当前快照即可（账号可能已被并发删除）
+			a2, err2 := s.db.GetAccount(id)
+			if err2 != nil {
+				writeAPIError(w, http.StatusNotFound, err2.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "account": accountPublicView(a2), "message": "刷新已在进行中"})
+			return
+		}
 		writeAPIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	a2, _ := s.db.GetAccount(id)
+	a2, err := s.db.GetAccount(id)
+	if err != nil {
+		// 刷新期间账号被删：如实 404，不得拿 nil 账号渲染
+		writeAPIError(w, http.StatusNotFound, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "account": accountPublicView(a2)})
 }
 
@@ -410,7 +530,12 @@ func (s *APIServer) handleResetStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "message": firstNonEmpty(bizMsg, err.Error()), "http_status": httpStatus})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "status": st})
+	synced, syncErr := s.zapi.SyncResetHistoryFromUpstream(a)
+	resp := map[string]interface{}{"ok": true, "status": st, "upstream_synced": synced}
+	if syncErr != nil {
+		resp["sync_message"] = syncErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleModelSync 同步官方模型目录
@@ -435,9 +560,11 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var body struct {
-		Group   *string `json:"group"`
-		Remark  *string `json:"remark"`
-		Enabled *bool   `json:"enabled"`
+		Group        *string `json:"group"`
+		Remark       *string `json:"remark"`
+		Enabled      *bool   `json:"enabled"`
+		Priority     *int64  `json:"priority"`
+		PaidFallback *bool   `json:"paid_fallback"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid request body")
@@ -448,7 +575,7 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 		writeAPIError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	group, remark, enabled := a.AccountGroup, a.Remark, a.Enabled
+	group, remark, enabled, paidFallback := a.AccountGroup, a.Remark, a.Enabled, a.PaidFallback
 	if body.Group != nil {
 		group = *body.Group
 	}
@@ -458,7 +585,19 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 	if body.Enabled != nil {
 		enabled = *body.Enabled
 	}
-	if err := s.db.UpdateAccountFields(id, group, remark, enabled); err != nil {
+	if body.PaidFallback != nil {
+		paidFallback = *body.PaidFallback
+	}
+	// 全部入参先校验再动笔：否则 priority 非法时 400，但 group/remark/enabled
+	// 已落库——面板以为保存失败，重试时静默保留了上一次"失败"的修改。
+	// 0 不是有效值（accountPriority 会把 0 归一化回默认值，API 却显示保存成功）
+	if body.Priority != nil && (*body.Priority < 1 || *body.Priority > 9999) {
+		writeAPIError(w, http.StatusBadRequest, "priority 取值范围 1-9999")
+		return
+	}
+	// 单事务更新（字段+priority 原子落库）：两条独立 UPDATE 会在第二条失败时
+	// 留下"半保存"状态，面板以为全失败而前一半已生效
+	if err := s.db.UpdateAccountFieldsWithPriority(id, group, remark, enabled, paidFallback, body.Priority); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -487,7 +626,10 @@ func (s *APIServer) handleSwitchBack(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		KillClient bool `json:"kill_client"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 	if err := s.acctMgr.SwitchBackToLocal(id, body.KillClient); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -571,8 +713,37 @@ func (s *APIServer) handleSavePlan(w http.ResponseWriter, r *http.Request) {
 	if p.TaskType == "" {
 		p.TaskType = "claim"
 	}
+	switch p.TaskType {
+	case "claim", "detect", "activate":
+	case "reset":
+		writeAPIError(w, http.StatusBadRequest, "重置仅支持在账号页面手动执行，不支持计划任务")
+		return
+	default:
+		writeAPIError(w, http.StatusBadRequest, "无效任务类型: "+p.TaskType)
+		return
+	}
 	if p.TargetType == "" {
 		p.TargetType = "all_accounts"
+	}
+	switch p.TargetType {
+	case "all_accounts", "single_account", "group":
+	default:
+		// 未知 target_type 会被调度器当 all_accounts 处理——写错一个字母
+		// 就从"单账号"静默变成"全账号"，必须保存时就拒绝
+		writeAPIError(w, http.StatusBadRequest, "无效目标类型: "+p.TargetType)
+		return
+	}
+	if p.TargetType == "single_account" && p.AccountID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "single_account 目标必须提供有效 account_id")
+		return
+	}
+	// POST 路径不含 {id}：客户端误带 body id 会把"新建"静默变成"覆盖他者"
+	if r.Method == http.MethodPost {
+		p.ID = 0
+	} else if _, err := s.db.GetClaimPlan(p.ID); err != nil {
+		// PUT：目标不存在时如实 404，而不是 0 行更新的假成功
+		writeAPIError(w, http.StatusNotFound, "计划不存在: "+strconv.FormatInt(p.ID, 10))
+		return
 	}
 	id, err := s.db.SaveClaimPlan(&p)
 	if err != nil {
@@ -601,8 +772,29 @@ func (s *APIServer) handleRunPlan(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
+	plan, err := s.db.GetClaimPlan(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeAPIError(w, http.StatusNotFound, "计划不存在")
+		} else {
+			writeAPIError(w, http.StatusInternalServerError, "计划查询失败")
+		}
+		return
+	}
+	if plan.TaskType == "reset" {
+		writeAPIError(w, http.StatusBadRequest, "重置仅支持在账号页面手动执行，不支持计划任务")
+		return
+	}
 	if err := s.scheduler.RunPlanNow(id); err != nil {
-		writeAPIError(w, http.StatusBadRequest, err.Error())
+		msg := err.Error()
+		switch {
+		case strings.Contains(msg, "不存在"):
+			writeAPIError(w, http.StatusNotFound, msg)
+		case strings.Contains(msg, "正在执行"):
+			writeAPIError(w, http.StatusConflict, msg)
+		default:
+			writeAPIError(w, http.StatusBadRequest, msg)
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "计划已开始执行"})
@@ -626,7 +818,17 @@ func (s *APIServer) handlePlanRuns(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIServer) handleClaimRecords(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 100)
-	accountID := int64(queryInt(r, "account_id", 0))
+	// account_id 不传 = 不过滤；显式传了就必须是正整数，否则 400
+	// （静默吞掉会让脚本消费者在不知情下拿到全账号数据）
+	accountID := int64(0)
+	if v := r.URL.Query().Get("account_id"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "account_id 须为正整数")
+			return
+		}
+		accountID = n
+	}
 	records, err := s.db.ListClaimRecords(limit, accountID)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
@@ -652,6 +854,10 @@ func (s *APIServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 当日付费通道 token 消耗（免费优先/付费回退策略的观测口径）
+	if paid, err := s.db.PaidTokensToday(); err == nil {
+		stats["paid_tokens_today"] = paid
+	}
 	writeJSON(w, http.StatusOK, stats)
 }
 
@@ -661,7 +867,20 @@ func (s *APIServer) handleStats(w http.ResponseWriter, r *http.Request) {
 var settingsWhitelist = map[string]bool{
 	"selection_strategy": true, "quota_refresh_interval": true,
 	"upstream_proxy": true, "fingerprint": true, "custom_ja3": true,
-	"captcha_mode": true, "gateway_models": true,
+	"captcha_mode": true, "gateway_models": true, "sticky_sessions": true,
+	"prompt_cache_breakpoint": true,
+	"captcha_prewarm":         true,
+	"auto_claim_promos":       true, "auto_claim_interval_minutes": true, "auto_claim_delay_seconds": true,
+	"auto_reset_enabled": true, "auto_reset_min_wait_minutes": true, "auto_reset_min_wait_week_hours": true,
+	"auto_reset_expiry_enabled": true, "auto_reset_expiry_spend_minutes": true,
+	"max_concurrent_per_account": true,
+	// 免费优先 / 付费回退策略
+	"paid_fallback_mode": true, "paid_daily_token_cap": true,
+	// 闲时免费通道（off-peak ticket queue）
+	"async_enabled": true, "async_poll_interval_ms": true,
+	"async_keepalive_ms": true, "async_max_retries": true, "async_max_wait_sec": true,
+	// 用量记录保留天数（0=永久；每 6h 清扫一次）
+	"usage_retention_days": true,
 }
 
 func (s *APIServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -676,9 +895,35 @@ func (s *APIServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		all["has_api_key"] = "1"
 		delete(all, "api_key")
 	}
+	// upstream_proxy 已入 vault 机密表。GET 只回剥离凭据的显示形状
+	// （scheme://host:port + upstream_proxy_has_auth 标记）：user:pass 是凭据，
+	// 纯 session 可读等于 stolen session 直接拿走出口代理凭据（与根 Key 脱敏
+	// 同一模型）。读取出错时删键而非回传密文
+	if _, ok := all["upstream_proxy"]; ok {
+		if v, err := s.db.GetSetting("upstream_proxy"); err == nil {
+			all["upstream_proxy"] = stripProxyUserinfo(v)
+			if u, perr := url.Parse(v); perr == nil && u.User != nil {
+				all["upstream_proxy_has_auth"] = "1"
+			}
+		} else {
+			delete(all, "upstream_proxy")
+		}
+	}
 	all["app_version"] = s.zapi.appVersion
 	all["listen_addr"] = s.cfg.GetListenAddr()
 	writeJSON(w, http.StatusOK, all)
+}
+
+// stripProxyUserinfo 代理 URL 剥离内嵌凭据（scheme://user:pass@host:port →
+// scheme://host:port），供 settings GET 展示；解析失败原样返回（非法值由
+// PUT 的校验拦截，展示层不做二次裁决）
+func stripProxyUserinfo(proxyURL string) string {
+	u, err := url.Parse(proxyURL)
+	if err != nil || u.User == nil {
+		return proxyURL
+	}
+	u.User = nil
+	return u.String()
 }
 
 func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
@@ -688,13 +933,17 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	updated := []string{}
+	// 两阶段：先整体校验再落库。map 迭代顺序随机，边验边写会在批次含非法值时
+	// 非确定性地写入一半设置却返回 400
+	type settingKV struct{ k, v string }
+	pending := []settingKV{}
 	for k, v := range body {
 		if !settingsWhitelist[k] {
 			continue
 		}
 		if k == "selection_strategy" {
 			switch v {
-			case StrategyRandom, StrategyRoundRobin, StrategyBestQuota:
+			case StrategyRandom, StrategyRoundRobin, StrategyBestQuota, StrategyPriority:
 			default:
 				writeAPIError(w, http.StatusBadRequest, "无效策略: "+v)
 				return
@@ -703,6 +952,42 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		if k == "quota_refresh_interval" {
 			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 86400 {
 				writeAPIError(w, http.StatusBadRequest, "无效刷新间隔")
+				return
+			}
+		}
+		// 用量保留天数：0=永久，上限 10 年（防手滑多零把清理变摆设）
+		if k == "usage_retention_days" {
+			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 3650 {
+				writeAPIError(w, http.StatusBadRequest, "无效保留天数（0=永久，上限 3650）")
+				return
+			}
+		}
+		// auto-reset 数值项按 UI 界限校验：静默收下非法值会让 settingInt 回落
+		// 默认（保存≠生效），或把"临期窗口"撑到 10 天令每个槽位恒"临期"
+		if k == "auto_reset_min_wait_minutes" || k == "auto_reset_expiry_spend_minutes" {
+			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 1440 {
+				writeAPIError(w, http.StatusBadRequest, "无效阈值（0-1440 分钟）")
+				return
+			}
+		}
+		if k == "auto_reset_min_wait_week_hours" {
+			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 168 {
+				writeAPIError(w, http.StatusBadRequest, "无效阈值（0-168 小时）")
+				return
+			}
+		}
+		// 付费回退策略：白名单取值；token 上限非负整数（0=不限）
+		if k == "paid_fallback_mode" {
+			switch v {
+			case PaidModeFreeFirst, PaidModeBalanced, PaidModeNever:
+			default:
+				writeAPIError(w, http.StatusBadRequest, "无效付费回退策略: "+v)
+				return
+			}
+		}
+		if k == "paid_daily_token_cap" {
+			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil || n < 0 {
+				writeAPIError(w, http.StatusBadRequest, "无效付费 token 上限（非负整数，0=不限）")
 				return
 			}
 		}
@@ -717,11 +1002,41 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if err := s.db.SetSetting(k, v); err != nil {
+		if k == "upstream_proxy" && strings.TrimSpace(v) != "" {
+			// 无校验的代理值会静默退化成直连（隐私失败）或全量连接失败
+			trimmed := strings.TrimSpace(v)
+			u, err := url.Parse(trimmed)
+			if err != nil || u.Host == "" {
+				writeAPIError(w, http.StatusBadRequest, "无效上游代理地址（示例: http://host:port 或 socks5://user:pass@host:port）")
+				return
+			}
+			switch u.Scheme {
+			case "http", "https", "socks5", "socks5h":
+			default:
+				writeAPIError(w, http.StatusBadRequest, "不支持的代理协议: "+u.Scheme+"（支持 http/https/socks5/socks5h）")
+				return
+			}
+			if (u.Scheme == "socks5" || u.Scheme == "socks5h") && u.Port() == "" {
+				writeAPIError(w, http.StatusBadRequest, "socks5 代理必须带端口（如 socks5://host:1080）")
+				return
+			}
+			v = trimmed // 校验通过后存 trimmed 值，保证"所存即可解析"
+			// 脱敏回写保护：GET 只回剥离凭据的形状，UI 原样回传等于"没改"——
+			// 当新值落库会静默抹掉已存的 user:pass。与库存量值的剥离形状一致
+			// 即跳过该项保留原值。取舍：想清掉凭据但保留主机需清空整个字段重填
+			// （单独"去凭据"与脱敏形状无法区分）
+			if cur, gerr := s.db.GetSetting("upstream_proxy"); gerr == nil && cur != "" && stripProxyUserinfo(cur) == v {
+				continue
+			}
+		}
+		pending = append(pending, settingKV{k, v})
+	}
+	for _, kv := range pending {
+		if err := s.db.SetSetting(kv.k, kv.v); err != nil {
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		updated = append(updated, k)
+		updated = append(updated, kv.k)
 	}
 	// 指纹/代理变更：失效并关闭缓存的上游客户端连接池
 	for _, k := range updated {
@@ -746,7 +1061,8 @@ func (s *APIServer) handleListProxies(w http.ResponseWriter, r *http.Request) {
 		item := map[string]interface{}{
 			"id": n.ID, "name": n.Name, "type": n.Type, "host": n.Host, "port": n.Port,
 			"username": n.Username, "has_password": n.Password != "",
-			"is_default": n.IsDefault, "group_name": n.GroupName, "enabled": n.Enabled,
+			"password_broken": n.PasswordBroken,
+			"is_default":      n.IsDefault, "group_name": n.GroupName, "enabled": n.Enabled,
 			"check_status": n.CheckStatus, "check_latency": n.CheckLatency,
 			"check_ip": n.CheckIP, "check_msg": n.CheckMsg, "check_at": n.CheckAt,
 			"created_at": n.CreatedAt, "updated_at": n.UpdatedAt,
@@ -770,21 +1086,35 @@ func (s *APIServer) handleSaveProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		n.ID = id
 	}
-	if n.Host == "" || n.Port <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "host/port 必填")
+	if n.Host == "" || n.Port <= 0 || n.Port > 65535 {
+		writeAPIError(w, http.StatusBadRequest, "host 必填，port 须在 1-65535")
 		return
 	}
-	// 编辑时密码留空 = 保持原密码
-	if n.ID > 0 && n.Password == "" {
-		if old, err := s.db.ListProxyNodes(); err == nil {
-			for _, o := range old {
+	switch n.Type {
+	case "socks5", "http", "https":
+	default:
+		writeAPIError(w, http.StatusBadRequest, "无效代理类型: "+n.Type+"（支持 socks5/http/https）")
+		return
+	}
+	if r.Method == http.MethodPost {
+		n.ID = 0 // POST 不接受 body id：防止"新建"静默覆盖既有节点
+	} else {
+		exists := false
+		if nodes, err := s.db.ListProxyNodes(); err == nil {
+			for _, o := range nodes {
 				if o.ID == n.ID {
-					n.Password = o.Password
+					exists = true
 					break
 				}
 			}
 		}
+		if !exists {
+			writeAPIError(w, http.StatusNotFound, "代理节点不存在")
+			return
+		}
 	}
+	// 空密码 = 保持原密码：由 SaveProxyNode 直接跳过密码列实现（读回明文
+	// 再回写会在钥匙缺失期把解不开的密文冲成 ''，永久销毁）
 	id, err := s.db.SaveProxyNode(&n)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
@@ -841,7 +1171,10 @@ func (s *APIServer) handleTestProxyURL(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		URL string `json:"url"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 	ip, elapsed, err := TestProxyExitIP(strings.TrimSpace(body.URL))
 	resp := map[string]interface{}{
 		"ok": err == nil, "exit_ip": ip, "elapsed_ms": elapsed.Milliseconds(),
@@ -878,12 +1211,22 @@ func (s *APIServer) handleCaptchaSolve(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		AccountID int64 `json:"account_id"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 	var a *Account
 	if body.AccountID > 0 {
-		a, _ = s.db.GetAccount(body.AccountID)
+		var err error
+		a, err = s.db.GetAccount(body.AccountID)
+		// 静默降级到全局代理会在错误的出口 IP 下解题并缓存，后续该组账号
+		// 重放必然触发风控：显式 404 而不是 nil 账号继续
+		if err != nil || a == nil {
+			writeAPIError(w, http.StatusNotFound, "account not found")
+			return
+		}
 	}
-	param, region, err := s.captcha.GetVerifyParam(a)
+	param, region, err := s.captcha.GetVerifyParamCtx(r.Context(), a)
 	if err != nil {
 		writeAPIError(w, http.StatusBadGateway, err.Error())
 		return
@@ -929,6 +1272,3 @@ func queryInt(r *http.Request, key string, def int) int {
 	}
 	return n
 }
-
-var _ = log.Printf
-var _ = fmt.Sprintf

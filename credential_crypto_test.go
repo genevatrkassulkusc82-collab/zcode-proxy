@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"strings"
@@ -34,7 +36,7 @@ func TestEncV1Roundtrip(t *testing.T) {
 // TestEncV1CrossLanguageVector 与 zcode-switch 测试向量互操作
 // 向量来自 refs/zcode-switch/src-tauri/test-vectors/node-enc-v1.json（Node 客户端加密，Rust 解密验证）
 func TestEncV1CrossLanguageVector(t *testing.T) {
-	data, err := os.ReadFile(`refs\zcode-switch\src-tauri\test-vectors\node-enc-v1.json`)
+	data, err := os.ReadFile(`refs/zcode-switch/src-tauri/test-vectors/node-enc-v1.json`)
 	if err != nil {
 		// 向量文件可能不存在于浅克隆，跳过
 		t.Skipf("vector file missing: %v", err)
@@ -91,5 +93,40 @@ func TestDecodeJWTPayload(t *testing.T) {
 	}
 	if claims["user_id"] != "123456" {
 		t.Fatalf("bad claim: %v", claims)
+	}
+}
+
+// TestImportBundleLegacy120k 旧版 120k 轮次的包经 legacy 路径兼容导入
+func TestImportBundleLegacy120k(t *testing.T) {
+	// 条目缺 user_id，导入循环跳过，不触数据库
+	plain, _ := json.Marshal(map[string]interface{}{"version": 1, "accounts": []bundleAccount{
+		{Email: "legacy@test"},
+	}})
+	salt := make([]byte, 16)
+	nonce := make([]byte, 12)
+	if _, err := rand.Read(salt); err != nil {
+		t.Fatalf("salt: %v", err)
+	}
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+	gcm, err := bundleGCM("legacy-pw", salt, legacyPBKDF2Iterations)
+	if err != nil {
+		t.Fatalf("gcm: %v", err)
+	}
+	ct := gcm.Seal(nil, nonce, plain, nil)
+	raw := append(append(append([]byte{}, salt...), nonce...), ct...)
+	bundle := bundlePrefix + base64.StdEncoding.EncodeToString(raw)
+
+	m := &AccountManager{}
+	n, err := m.ImportBundle("legacy-pw", bundle)
+	if err != nil {
+		t.Fatalf("legacy 120k import failed: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 imported, got %d", n)
+	}
+	if _, err := m.ImportBundle("wrong-pw", bundle); err == nil {
+		t.Fatal("wrong password should be rejected")
 	}
 }

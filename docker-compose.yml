@@ -1,0 +1,69 @@
+# zcode-proxy container deployment.
+#
+# Requirements before `docker compose up -d`:
+#   - config/config.json must set "listen_addr": "0.0.0.0:8687". The app's
+#     default is 127.0.0.1:8687, which only binds loopback inside the
+#     container and would make the published port unreachable.
+#   - The config/ mount is read-only: the app expects a config DIRECTORY and
+#     reads config.json from inside it (main.go -config flag). If the file is
+#     missing, the app tries to write a default one and fails on the RO mount.
+#   - The ./data bind mount must be writable by uid/gid 10001 (the container's
+#     unprivileged "app" user): `chown -R 10001:10001 ./data` before first start.
+#     A root-owned mount makes NewDB fatal on startup and — combined with
+#     `restart: unless-stopped` — the container crash-loops forever.
+#     Alternative without chown: comment out the ./data bind mount and use a
+#     named volume instead (Docker initializes it with the image's ownership):
+#       volumes:
+#         - zcode-data:/app/data
+#       # ...and at file scope:
+#       volumes:
+#         zcode-data: {}
+#   - First start bootstrap: with no ZCODE_WEB_PASS and an empty database, the
+#     initial admin password is written to /app/data/initial_admin_password
+#     (mode 0600) — read it with `docker compose exec zcode-proxy cat
+#     /app/data/initial_admin_password`. It is NOT printed to the log (only
+#     the file path is). Change the password in the web UI afterwards.
+#   - TLS-fronted deployments (reverse proxy terminates HTTPS): set
+#     ZCODE_COOKIE_SECURE=1 so the session cookie gets the Secure flag
+#     (r.TLS is always nil behind a proxy, so detection alone can't do it).
+#     Do NOT enable it for plain-HTTP panels — Secure cookies are dropped
+#     and login will silently stop working.
+services:
+  zcode-proxy:
+    build: .
+    container_name: zcode-proxy
+    restart: unless-stopped
+    # Shutdown waits total 205s, including deferred Stop calls; allow cleanup headroom.
+    stop_grace_period: 4m
+    ports:
+      # Loopback-only by default: the admin panel must not be reachable from
+      # the network by accident. To expose deliberately, change to "8687:8687"
+      # (all interfaces) and put a TLS reverse proxy in front.
+      - "127.0.0.1:8687:8687"
+    volumes:
+      - ./data:/app/data          # SQLite DB + vault.key + initial_admin_password (all auto-generated next to the DB)
+      - ./config:/app/config:ro   # config.json — secrets stay out of the image
+    environment:
+      # Web UI login password (main.go: os.Getenv("ZCODE_WEB_PASS")).
+      # Empty is safe: a random 20-char admin password is generated and persisted
+      # to /app/data/initial_admin_password (0600) on first start — read it there;
+      # auth is never unset. Set this explicitly to choose your own password.
+      ZCODE_WEB_PASS: ${ZCODE_WEB_PASS:-}
+      # Vault seed override (vault.go: os.Getenv("ZCODE_PROXY_VAULT_SECRET")).
+      # If unset, a random vault.key is generated in /app/data on first run.
+      ZCODE_PROXY_VAULT_SECRET: ${ZCODE_PROXY_VAULT_SECRET:-}
+      # Credential encryption secret (credential_crypto.go: ZCODE_CREDENTIAL_SECRET).
+      ZCODE_CREDENTIAL_SECRET: ${ZCODE_CREDENTIAL_SECRET:-}
+      # Credential-switch home override (credential_crypto.go: ZCODE_SWITCH_HOME).
+      ZCODE_SWITCH_HOME: ${ZCODE_SWITCH_HOME:-}
+      # Force the Secure flag on the session cookie (auth.go cookieSecureOverride).
+      # Only for TLS-fronted deployments — see the note in the header above.
+      ZCODE_COOKIE_SECURE: ${ZCODE_COOKIE_SECURE:-}
+    healthcheck:
+      # Alpine runtime ships busybox wget; /health is unauthenticated (auth.go).
+      # Port must match listen_addr in config.json.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8687/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
