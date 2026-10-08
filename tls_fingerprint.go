@@ -146,6 +146,13 @@ func utlsHandshake(ctx context.Context, rawConn net.Conn, serverName string, fp 
 		rawConn.Close()
 		return nil, err
 	}
+	// 指纹传输层禁用了 h2（TLSNextProto 置空），而 utls 的 ConnectionState
+	// 类型 net/http 无法识别——若服务器据 ALPN 选中 h2，HTTP/1.1 字节写进
+	// h2 流只会得到难以排查的畸形响应，这里显式快速失败
+	if proto := uconn.ConnectionState().NegotiatedProtocol; proto == "h2" {
+		rawConn.Close()
+		return nil, fmt.Errorf("上游协商了 h2，指纹传输层仅支持 http/1.1")
+	}
 	return uconn, nil
 }
 
@@ -157,10 +164,25 @@ func ja3ToClientHelloSpec(ja3 string) (*tls.ClientHelloSpec, error) {
 	if len(parts) != 5 {
 		return nil, fmt.Errorf("JA3 需为 5 段（版本,密码套件,扩展,曲线,点格式）")
 	}
-	ciphers := parseU16List(parts[1])
-	extIDs := parseU16List(parts[2])
-	curves := parseU16List(parts[3])
-	pointFmts := parseU8List(parts[4])
+	ciphers, err := parseU16List(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("密码套件段: %w", err)
+	}
+	if len(ciphers) == 0 {
+		return nil, fmt.Errorf("密码套件列表为空")
+	}
+	extIDs, err := parseU16List(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("扩展段: %w", err)
+	}
+	curves, err := parseU16List(parts[3])
+	if err != nil {
+		return nil, fmt.Errorf("曲线段: %w", err)
+	}
+	pointFmts, err := parseU8List(parts[4])
+	if err != nil {
+		return nil, fmt.Errorf("点格式段: %w", err)
+	}
 
 	spec := &tls.ClientHelloSpec{
 		CipherSuites:       ciphers,
@@ -232,28 +254,36 @@ func defaultSigAlgs() []tls.SignatureScheme {
 	}
 }
 
-func parseU16List(s string) []uint16 {
-	if strings.TrimSpace(s) == "" {
-		return nil
+// parseU16List 解析 JA3 数值列表；任何非法 token 都报错——静默跳过会产出
+// 缺字段的 ClientHello（如空 cipher 套件），握手必败且难以排查
+func parseU16List(s string) ([]uint16, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
 	}
 	var out []uint16
 	for _, p := range strings.Split(s, "-") {
-		if n, err := strconv.ParseUint(strings.TrimSpace(p), 10, 16); err == nil {
-			out = append(out, uint16(n))
+		n, err := strconv.ParseUint(strings.TrimSpace(p), 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("非法数值 %q（应为 0-65535）", p)
 		}
+		out = append(out, uint16(n))
 	}
-	return out
+	return out, nil
 }
 
-func parseU8List(s string) []uint8 {
-	if strings.TrimSpace(s) == "" {
-		return nil
+func parseU8List(s string) ([]uint8, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
 	}
 	var out []uint8
 	for _, p := range strings.Split(s, "-") {
-		if n, err := strconv.ParseUint(strings.TrimSpace(p), 10, 8); err == nil {
-			out = append(out, uint8(n))
+		n, err := strconv.ParseUint(strings.TrimSpace(p), 10, 8)
+		if err != nil {
+			return nil, fmt.Errorf("非法数值 %q（应为 0-255）", p)
 		}
+		out = append(out, uint8(n))
 	}
-	return out
+	return out, nil
 }
