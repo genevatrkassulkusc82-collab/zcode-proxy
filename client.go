@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/net/proxy"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -28,7 +30,7 @@ const (
 	zcodeOrigin       = "https://zcode.z.ai"
 	zcodeLang         = "zh-CN"
 	zcodeChannel      = "stable"
-	fallbackAppVer    = "3.11.2"
+	fallbackAppVer    = "3.14.4"
 	screenResolution  = "2560x1440"
 	anthropicVersionH = "2023-06-01"
 )
@@ -100,6 +102,14 @@ func detectTimezone() string {
 			return tz
 		}
 	}
+	// macOS 无 /etc/timezone：/etc/localtime 是指向 zoneinfo 的符号链接
+	if tgt, err := os.Readlink("/etc/localtime"); err == nil {
+		if i := strings.LastIndex(tgt, "/zoneinfo/"); i >= 0 {
+			if tz := tgt[i+len("/zoneinfo/"):]; tz != "" {
+				return tz
+			}
+		}
+	}
 	return "UTC"
 }
 
@@ -124,12 +134,47 @@ func detectOSVersion() string {
 	return "10.0.19044"
 }
 
-// DetectZCodeAppVersion 从注册表卸载信息探测已安装 ZCode 版本（zcode-switch 同款逻辑），
-// 找不到时回退内置版本号。
+// DetectZCodeAppVersion 探测已安装 ZCode 客户端版本：Windows 读注册表卸载信息
+// （zcode-switch 同款逻辑），macOS 读 /Applications/ZCode.app 的 Info.plist，
+// 找不到时回退内置版本号（与官方 zai-org/ZCode 当前发布版本对齐）。
 func DetectZCodeAppVersion() string {
-	if runtime.GOOS != "windows" {
-		return fallbackAppVer
+	switch runtime.GOOS {
+	case "windows":
+		if v := detectWindowsAppVersion(); v != "" {
+			return v
+		}
+	case "darwin":
+		if v := detectDarwinAppVersion(); v != "" {
+			return v
+		}
 	}
+	return fallbackAppVer
+}
+
+// detectDarwinAppVersion 从应用包 Info.plist 读取 CFBundleShortVersionString
+func detectDarwinAppVersion() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	paths := []string{
+		"/Applications/ZCode.app/Contents/Info.plist",
+		home + "/Applications/ZCode.app/Contents/Info.plist",
+	}
+	re := regexp.MustCompile(`CFBundleShortVersionString</key>\s*<string>([0-9]+(?:\.[0-9]+)+)</string>`)
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if m := re.FindSubmatch(data); m != nil {
+			return normalizeVersion(string(m[1]))
+		}
+	}
+	return ""
+}
+
+func detectWindowsAppVersion() string {
 	hives := []string{
 		`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`,
 		`HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall`,
@@ -166,7 +211,7 @@ func DetectZCodeAppVersion() string {
 			return normalizeVersion(ver)
 		}
 	}
-	return fallbackAppVer
+	return ""
 }
 
 func stripPrefix(s, prefix string) (string, bool) {
@@ -228,17 +273,17 @@ func LocalDeviceMid() string {
 func ZaiClientHeaders(id ClientIdentity) map[string]string {
 	clientInfoOnce.Do(initClientInfo)
 	h := map[string]string{
-		"User-Agent":         "ZCode/" + id.AppVersion,
-		"HTTP-Referer":       zcodeOrigin,
-		"X-Title":            "Z Code@electron",
+		"User-Agent":          "ZCode/" + id.AppVersion,
+		"HTTP-Referer":        zcodeOrigin,
+		"X-Title":             "Z Code@electron",
 		"X-ZCode-App-Version": id.AppVersion,
-		"X-Platform":         cachedPlatform,
-		"X-Release-Channel":  zcodeChannel,
-		"X-Client-Language":  zcodeLang,
-		"X-Client-Timezone":  cachedTZ,
-		"X-Os-Category":      cachedOSCat,
-		"x-request-id":       id.RequestID,
-		"Content-Type":       "application/json",
+		"X-Platform":          cachedPlatform,
+		"X-Release-Channel":   zcodeChannel,
+		"X-Client-Language":   zcodeLang,
+		"X-Client-Timezone":   cachedTZ,
+		"X-Os-Category":       cachedOSCat,
+		"x-request-id":        id.RequestID,
+		"Content-Type":        "application/json",
 	}
 	if cachedOSVer != "" {
 		h["X-Os-Version"] = cachedOSVer
@@ -271,10 +316,11 @@ func ProxyURLForNode(n *ProxyNode) string {
 // 等非 ESA WAF 保护的端点（实测 api.z.ai 协商 h2）。
 func NewUpstreamHTTPClient(proxyURL string, timeout time.Duration) *http.Client {
 	transport := &http.Transport{
-		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
-		ForceAttemptHTTP2: true,
-		MaxIdleConns:      32,
-		IdleConnTimeout:   90 * time.Second,
+		TLSClientConfig:      &tls.Config{MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2:    true,
+		MaxIdleConns:         32,
+		MaxIdleConnsPerHost:  16, // Go 默认 2：并发下多余连接被关闭，每请求重握手直拉高 TTFB
+		IdleConnTimeout:      90 * time.Second,
 	}
 	applyProxy(transport, proxyURL)
 	return &http.Client{
@@ -306,11 +352,12 @@ func NewFingerprintHTTPClient(proxyURL string, timeout time.Duration) *http.Clie
 	}
 
 	transport := &http.Transport{
-		DialContext:     dialer.DialContext,
-		DialTLSContext:  dialTLS,
-		TLSNextProto:    map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
-		MaxIdleConns:    32,
-		IdleConnTimeout: 90 * time.Second,
+		DialContext:          dialer.DialContext,
+		DialTLSContext:       dialTLS,
+		TLSNextProto:         map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
+		MaxIdleConns:         32,
+		MaxIdleConnsPerHost:  16, // utls 握手成本高，保活连接直接决定 TTFB 稳定性
+		IdleConnTimeout:      90 * time.Second,
 	}
 	return &http.Client{
 		Transport: transport,
@@ -384,6 +431,11 @@ func dialRaw(ctx context.Context, dialer *net.Dialer, proxyURL, network, addr st
 		if err != nil {
 			return nil, err
 		}
+		// 必须走 ContextDialer：旧 Dial 内部用 context.Background()，
+		// 代理握手不响应时会永久泄漏 goroutine 和连接（ctx 取消救不了它）
+		if cd, ok := sd.(proxy.ContextDialer); ok {
+			return cd.DialContext(ctx, network, addr)
+		}
 		return sd.Dial(network, addr)
 	default: // http/https 代理：CONNECT 隧道
 		conn, err := dialer.DialContext(ctx, "tcp", u.Host)
@@ -400,6 +452,23 @@ func dialRaw(ctx context.Context, dialer *net.Dialer, proxyURL, network, addr st
 
 // httpConnectTunnel 向 HTTP 代理发送 CONNECT 并等待 200
 func httpConnectTunnel(ctx context.Context, conn net.Conn, addr string, proxyURL *url.URL) error {
+	// CONNECT 握手（写请求 + 读响应）必须有界：代理接受 TCP 后不回包时，
+	// ReadResponse 会永久阻塞且 ctx 取消救不了它——用看门狗关连接
+	if dl, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(dl)
+	} else {
+		conn.SetDeadline(time.Now().Add(30 * time.Second))
+	}
+	watchdog := make(chan struct{})
+	defer conn.SetDeadline(time.Time{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-watchdog:
+		}
+	}()
+	defer close(watchdog)
 	req := &http.Request{
 		Method: http.MethodConnect,
 		URL:    &url.URL{Opaque: addr},

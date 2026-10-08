@@ -1,0 +1,38 @@
+# zcode-proxy container deployment.
+#
+# Requirements before `docker compose up -d`:
+#   - config/config.json must set "listen_addr": "0.0.0.0:8687". The app's
+#     default is 127.0.0.1:8687, which only binds loopback inside the
+#     container and would make the published port unreachable.
+#   - The config/ mount is read-only: the app expects a config DIRECTORY and
+#     reads config.json from inside it (main.go -config flag). If the file is
+#     missing, the app tries to write a default one and fails on the RO mount.
+services:
+  zcode-proxy:
+    build: .
+    container_name: zcode-proxy
+    restart: unless-stopped
+    ports:
+      - "8687:8687"
+    volumes:
+      - ./data:/app/data          # SQLite DB + vault.key (auto-generated next to the DB)
+      - ./config:/app/config:ro   # config.json — secrets stay out of the image
+    environment:
+      # Web UI login password (main.go: os.Getenv("ZCODE_WEB_PASS")).
+      # Empty means auth is effectively unset — set a strong password.
+      ZCODE_WEB_PASS: ${ZCODE_WEB_PASS:-}
+      # Vault seed override (vault.go: os.Getenv("ZCODE_PROXY_VAULT_SECRET")).
+      # If unset, a random vault.key is generated in /app/data on first run.
+      ZCODE_PROXY_VAULT_SECRET: ${ZCODE_PROXY_VAULT_SECRET:-}
+      # Credential encryption secret (credential_crypto.go: ZCODE_CREDENTIAL_SECRET).
+      ZCODE_CREDENTIAL_SECRET: ${ZCODE_CREDENTIAL_SECRET:-}
+      # Credential-switch home override (credential_crypto.go: ZCODE_SWITCH_HOME).
+      ZCODE_SWITCH_HOME: ${ZCODE_SWITCH_HOME:-}
+    healthcheck:
+      # Alpine runtime ships busybox wget; /health is unauthenticated (auth.go).
+      # Port must match listen_addr in config.json.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8687/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
