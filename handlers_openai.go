@@ -71,6 +71,12 @@ func (z *ZCodeAPI) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		errResp.Write(w)
 		return
 	}
+	// 网关无状态：拒绝依赖服务端会话的 previous_response_id（须整段回传 input）
+	if prid, _ := body["previous_response_id"].(string); prid != "" {
+		writeAPIError(w, http.StatusBadRequest,
+			"this gateway is stateless: previous_response_id is not supported; send the full conversation input each time")
+		return
+	}
 	if s, ok := body["stream"]; ok {
 		if _, isBool := s.(bool); !isBool {
 			writeAPIError(w, http.StatusBadRequest, "stream must be a boolean")
@@ -102,6 +108,107 @@ func (z *ZCodeAPI) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		proto: protocolResponses, clientStream: clientStream, clientModel: clientModel,
 	}
 	z.relay(w, r, rc)
+}
+
+// HandleCompletions POST /v1/completions — legacy text completion（Bifrost 等
+// 网关的 Text Completion 请求类型）。shim：prompt 转单条 chat 消息走同一
+// relay 管道，响应按 text_completion / text_completion.chunk 形状回写。
+func (z *ZCodeAPI) HandleCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	body, errResp := readJSONBody(r)
+	if errResp != nil {
+		errResp.Write(w)
+		return
+	}
+	if s, ok := body["stream"]; ok {
+		if _, isBool := s.(bool); !isBool {
+			writeAPIError(w, http.StatusBadRequest, "stream must be a boolean")
+			return
+		}
+	}
+	prompt, err := completionsPrompt(body["prompt"])
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if prompt == "" {
+		writeAPIError(w, http.StatusBadRequest, "prompt must not be empty")
+		return
+	}
+
+	chat := map[string]interface{}{
+		"model": body["model"],
+		"messages": []interface{}{
+			// 补一句系统引导：指令模型收到裸 prompt 时倾向"回答"而非"续写"
+			map[string]interface{}{"role": "system", "content": "You are a text completion engine. Continue the user's text seamlessly; output only the continuation, never repeat the prompt and add no commentary."},
+			map[string]interface{}{"role": "user", "content": prompt},
+		},
+	}
+	for _, k := range []string{"max_tokens", "temperature", "top_p", "stop", "stream", "stream_options"} {
+		if v, ok := body[k]; ok {
+			chat[k] = v
+		}
+	}
+	// suffix / n / logprobs / 各类 penalty 上游无法兑现，静默忽略
+
+	provider := detectProvider(chat, r.Header)
+	anth, err := openaiToAnthropic(chat)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	anth["stream"] = true // 内部一律流式，按需聚合
+	if err := normalizeBody(anth, z); err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateMessagesBody(anth); err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	clientStream, _ := chat["stream"].(bool)
+	clientModel, _ := body["model"].(string)
+	if clientModel == "" {
+		clientModel = "gpt-3.5-turbo-instruct"
+	}
+	includeUsage := false
+	if so, ok := chat["stream_options"].(map[string]interface{}); ok {
+		includeUsage, _ = so["include_usage"].(bool)
+	}
+	echo, _ := body["echo"].(bool)
+	rc := &relayCtx{
+		body: anth, provider: provider, group: r.Header.Get("x-zcode-group"),
+		proto: protocolCompletions, clientStream: clientStream,
+		clientModel: clientModel, includeUsage: includeUsage,
+		echo: echo, prompt: prompt,
+	}
+	z.relay(w, r, rc)
+}
+
+// completionsPrompt 提取并归一化 prompt：字符串原样；多元素数组按多采样语义
+// 上游无法批量生成，降级为空行拼接的单一 prompt
+func completionsPrompt(v interface{}) (string, error) {
+	switch p := v.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return p, nil
+	case []interface{}:
+		var parts []string
+		for _, item := range p {
+			s, ok := item.(string)
+			if !ok {
+				return "", errString("prompt array elements must be strings")
+			}
+			parts = append(parts, s)
+		}
+		return strings.Join(parts, "\n\n"), nil
+	default:
+		return "", errString("prompt must be a string or array of strings")
+	}
 }
 
 // asIfaceSlice 将 []interface{} 或 []map[string]interface{} 等切片统一为 []interface{}
@@ -185,7 +292,11 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 		var blocks []map[string]interface{}
 		switch c := content.(type) {
 		case string:
-			blocks = append(blocks, map[string]interface{}{"type": "text", "text": c})
+			// 空串 text 块会被 Anthropic schema 拒绝（"at least 1 character"）；
+			// 工具调用回合常带 content:""，必须跳过而不是转发整单 400
+			if c != "" {
+				blocks = append(blocks, map[string]interface{}{"type": "text", "text": c})
+			}
 		case []interface{}:
 			for _, part := range c {
 				pm, ok := part.(map[string]interface{})
@@ -212,6 +323,11 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 								"type": "base64", "media_type": mime, "data": data,
 							},
 						})
+					} else {
+						// 不支持的图片形态（http(s) URL、字符串形态、null/空 url）一律
+						// 显式报错：静默丢弃会让纯图片消息整体消失，模型看到的对话
+						// 与客户端发送的不一致
+						return nil, errString("image_url must be an object with a data: base64 URL; other image forms are not supported by the upstream")
 					}
 				}
 			}
@@ -241,6 +357,10 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 				default:
 					toolInput = map[string]interface{}{}
 				}
+				if toolInput == nil {
+					// 字面量 "null"：Unmarshal 成功但得到 nil，input 必须是对象
+					toolInput = map[string]interface{}{}
+				}
 				id, _ := cm["id"].(string)
 				if id == "" {
 					id = "call_" + randomHex(8)
@@ -249,6 +369,9 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 					"type": "tool_use", "id": id, "name": name, "input": toolInput,
 				})
 			}
+			// R6：OpenAI 客户端重放助手回合时丢失签名思考块，
+			// 按其可见输出（文本 + 工具调用）查缓存静默回填；未命中不变
+			blocks = replayThinkingBlocks(blocks)
 		}
 		if len(blocks) > 0 {
 			item := map[string]interface{}{"role": role, "content": blocks}
@@ -261,15 +384,19 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 		}
 	}
 
+	// Anthropic 要求 user/assistant 严格交替：OpenAI 并行工具调用会产生
+	// 连续多条 user(tool_result)/assistant(tool_use) 消息，合并之
+	messages = mergeSameRoleMessages(messages)
 	out := map[string]interface{}{"model": model, "messages": toIfaceSlice(messages)}
 	if len(systemParts) > 0 {
 		out["system"] = strings.Join(systemParts, "\n\n")
 	}
-	if mt, ok := body["max_tokens"]; ok {
+	if mt, ok := body["max_tokens"]; ok && mt != nil {
 		out["max_tokens"] = mt
-	} else if mct, ok := body["max_completion_tokens"]; ok {
+	} else if mct, ok := body["max_completion_tokens"]; ok && mct != nil {
 		out["max_tokens"] = mct
-	} else {
+	} else if mt == nil && mct == nil {
+		// 显式 null 等同未提供：交给 normalizeBody 补默认值，而不是 400
 		out["max_tokens"] = float64(4096)
 	}
 	if t, ok := body["temperature"]; ok && t != nil {
@@ -285,6 +412,11 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 		case string:
 			out["stop_sequences"] = []interface{}{s}
 		}
+	}
+	// 透传 reasoning_effort：fixThinking 依赖它推导 output_config.effort，
+	// 丢弃会导致 GLM-5.3 恒定以 high 档运行（low/max 请求被静默降级/升级）
+	if e, ok := body["reasoning_effort"]; ok && e != nil {
+		out["reasoning_effort"] = e
 	}
 
 	// tools 转换
@@ -325,22 +457,64 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 		}
 	}
 
-	// tool_choice 转换
+	// tool_choice 转换；Anthropic 无 "none"：连同 tools 一起从上游请求中省略
 	switch tc := body["tool_choice"].(type) {
 	case string:
-		if tc == "auto" {
+		if tc == "none" {
+			delete(out, "tools")
+		} else if tc == "auto" {
 			out["tool_choice"] = map[string]interface{}{"type": "auto"}
 		} else if tc == "required" {
 			out["tool_choice"] = map[string]interface{}{"type": "any"}
 		}
 	case map[string]interface{}:
+		// Chat 形态 {"type":"function","function":{"name":...}} 与
+		// Responses 扁平形态 {"type":"function","name":...} 都要识别，
+		// 否则指定函数调用的 tool_choice 被静默丢弃
+		name := ""
 		if fn, ok := tc["function"].(map[string]interface{}); ok {
-			if name, _ := fn["name"].(string); name != "" {
-				out["tool_choice"] = map[string]interface{}{"type": "tool", "name": name}
+			name, _ = fn["name"].(string)
+		}
+		if name == "" {
+			if tcType, _ := tc["type"].(string); tcType == "function" {
+				name, _ = tc["name"].(string)
 			}
+		}
+		if name != "" {
+			out["tool_choice"] = map[string]interface{}{"type": "tool", "name": name}
 		}
 	}
 	return out, nil
+}
+
+// mergeSameRoleMessages 合并相邻同角色消息（内容块拼接），保证 user/assistant 交替
+func mergeSameRoleMessages(msgs []map[string]interface{}) []map[string]interface{} {
+	var out []map[string]interface{}
+	for _, m := range msgs {
+		if n := len(out); n > 0 && out[n-1]["role"] == m["role"] {
+			prevBlocks := asBlockList(out[n-1]["content"])
+			curBlocks := asBlockList(m["content"])
+			if prevBlocks != nil && curBlocks != nil {
+				out[n-1]["content"] = append(prevBlocks, curBlocks...)
+				continue
+			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// asBlockList 内容统一为块数组；无法归一化（nil 以外的非块形态）返回 nil 表示不合并
+func asBlockList(v interface{}) []map[string]interface{} {
+	switch c := v.(type) {
+	case []map[string]interface{}:
+		return c
+	case string:
+		return []map[string]interface{}{{"type": "text", "text": c}}
+	case nil:
+		return []map[string]interface{}{}
+	}
+	return nil
 }
 
 // ---- 请求体转换：OpenAI Responses → Anthropic Messages ----
@@ -446,9 +620,9 @@ func responsesToAnthropic(body map[string]interface{}) (map[string]interface{}, 
 		sysMsg := map[string]interface{}{"role": "system", "content": strings.Join(systemParts, "\n\n")}
 		chatBody["messages"] = append([]interface{}{sysMsg}, chatBody["messages"].([]interface{})...)
 	}
-	if mot, ok := body["max_output_tokens"]; ok {
+	if mot, ok := body["max_output_tokens"]; ok && mot != nil {
 		chatBody["max_tokens"] = mot
-	} else if mt, ok := body["max_tokens"]; ok {
+	} else if mt, ok := body["max_tokens"]; ok && mt != nil {
 		chatBody["max_tokens"] = mt
 	}
 	if t, ok := body["temperature"]; ok && t != nil {

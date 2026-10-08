@@ -10,15 +10,41 @@ import (
 // ---- 账号 CRUD ----
 
 // UpsertAccount 按 user_id 自然键插入或更新账号。
-// device_mid / creds_raw 采用 COALESCE(NULLIF(excluded.x,''), accounts.x)：
-// 新值为空时保留旧值，避免重导入抹掉设备指纹与本地凭证快照。
+// device_mid / creds_raw 用 COALESCE 保留旧值：
+// 新值为空时不会被后续导入清空（设备指纹与本地凭证快照不被抹掉）。
 func (db *DB) UpsertAccount(a *Account) (int64, error) {
-	res, err := db.conn.Exec(`
+	// 凭证列静态加密（写入密文，内存结构保持明文供调用方继续使用）；
+	// 任一列加密失败即中止写入——不得静默落明文
+	encAccess, err := vaultEncrypt(a.AccessToken)
+	if err != nil {
+		return 0, err
+	}
+	encRefresh, err := vaultEncrypt(a.RefreshToken)
+	if err != nil {
+		return 0, err
+	}
+	encJWT, err := vaultEncrypt(a.ZCodeJWT)
+	if err != nil {
+		return 0, err
+	}
+	encAPIKey, err := vaultEncrypt(a.APIKey)
+	if err != nil {
+		return 0, err
+	}
+	encUserInfo, err := vaultEncrypt(a.UserInfo)
+	if err != nil {
+		return 0, err
+	}
+	encCredsRaw, err := vaultEncrypt(a.CredsRaw)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := db.conn.Exec(`
 		INSERT INTO accounts (
 			user_id, email, display_name, provider, auth_type,
 			access_token, refresh_token, zcode_jwt, api_key, user_info,
-			device_mid, creds_raw, status, enabled, account_group, remark
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			device_mid, creds_raw, status, enabled, account_group, priority, remark
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(user_id) DO UPDATE SET
 			email         = COALESCE(NULLIF(excluded.email,''), accounts.email),
 			display_name  = COALESCE(NULLIF(excluded.display_name,''), accounts.display_name),
@@ -34,21 +60,20 @@ func (db *DB) UpsertAccount(a *Account) (int64, error) {
 			status        = CASE WHEN accounts.status IN ('disabled') THEN accounts.status ELSE excluded.status END,
 			enabled       = excluded.enabled,
 			account_group = COALESCE(NULLIF(excluded.account_group,''), accounts.account_group),
+			priority      = accounts.priority,
 			remark        = COALESCE(NULLIF(excluded.remark,''), accounts.remark),
 			updated_at    = datetime('now','localtime')`,
 		a.UserID, a.Email, a.DisplayName, a.Provider, a.AuthType,
-		a.AccessToken, a.RefreshToken, a.ZCodeJWT, a.APIKey, a.UserInfo,
-		a.DeviceMid, a.CredsRaw, a.Status, boolInt(a.Enabled), a.AccountGroup, a.Remark)
-	if err != nil {
+		encAccess, encRefresh, encJWT, encAPIKey, encUserInfo,
+		a.DeviceMid, encCredsRaw, a.Status, boolInt(a.Enabled), a.AccountGroup, accountPriority(a), a.Remark); err != nil {
 		return 0, err
 	}
-	// 取回真实 ID（插入取 LastInsertId，冲突更新按 user_id 查）
-	id, err := res.LastInsertId()
-	if err != nil || id == 0 {
-		row := db.conn.QueryRow(`SELECT id FROM accounts WHERE user_id = ?`, a.UserID)
-		if err := row.Scan(&id); err != nil {
-			return 0, err
-		}
+	// 冲突更新分支不会推进 last_insert_rowid，驱动返回的是连接上一次
+	// INSERT 的残留值——用它会给错误账户写额度/状态。按自然键回查真实 ID。
+	var id int64
+	row := db.conn.QueryRow(`SELECT id FROM accounts WHERE user_id = ?`, a.UserID)
+	if err := row.Scan(&id); err != nil {
+		return 0, err
 	}
 	return id, nil
 }
@@ -60,9 +85,23 @@ func boolInt(b bool) int {
 	return 0
 }
 
+// DefaultPriority / PromoPriority priority 策略默认值：数值小者优先被选
+const (
+	DefaultPriority = int64(100)
+	PromoPriority   = int64(50)
+)
+
+// accountPriority 归一化：未设置/非法值回落默认
+func accountPriority(a *Account) int64 {
+	if a.Priority > 0 {
+		return a.Priority
+	}
+	return DefaultPriority
+}
+
 const accountCols = `id, user_id, email, display_name, provider, auth_type,
 	access_token, refresh_token, zcode_jwt, api_key, user_info, device_mid, creds_raw,
-	status, enabled, account_group, quota_json, plan_tier, plan_expire,
+	status, enabled, account_group, priority, quota_json, plan_tier, plan_expire,
 	total_units, used_units, remaining, use_count, fail_count,
 	last_used_at, last_checked_at, cooling_until, last_error,
 	last_claim_at, last_claim_plan, last_claim_msg, remark, created_at, updated_at`
@@ -73,7 +112,7 @@ func scanAccount(row interface{ Scan(...interface{}) error }) (*Account, error) 
 	err := row.Scan(
 		&a.ID, &a.UserID, &a.Email, &a.DisplayName, &a.Provider, &a.AuthType,
 		&a.AccessToken, &a.RefreshToken, &a.ZCodeJWT, &a.APIKey, &a.UserInfo, &a.DeviceMid, &a.CredsRaw,
-		&a.Status, &enabled, &a.AccountGroup, &a.QuotaJSON, &a.PlanTier, &a.PlanExpire,
+		&a.Status, &enabled, &a.AccountGroup, &a.Priority, &a.QuotaJSON, &a.PlanTier, &a.PlanExpire,
 		&a.TotalUnits, &a.UsedUnits, &a.Remaining, &a.UseCount, &a.FailCount,
 		&a.LastUsedAt, &a.LastCheckedAt, &a.CoolingUntil, &a.LastError,
 		&a.LastClaimAt, &a.LastClaimPlan, &a.LastClaimMsg, &a.Remark, &a.CreatedAt, &a.UpdatedAt)
@@ -81,7 +120,111 @@ func scanAccount(row interface{ Scan(...interface{}) error }) (*Account, error) 
 		return nil, err
 	}
 	a.Enabled = enabled == 1
+	// 凭证列静态加密：读取时透明解密
+	a.AccessToken = vaultDecrypt(a.AccessToken)
+	a.RefreshToken = vaultDecrypt(a.RefreshToken)
+	a.ZCodeJWT = vaultDecrypt(a.ZCodeJWT)
+	a.APIKey = vaultDecrypt(a.APIKey)
+	a.UserInfo = vaultDecrypt(a.UserInfo)
+	a.CredsRaw = vaultDecrypt(a.CredsRaw)
 	return &a, nil
+}
+
+// ---- 运行时字段并发保护 ----
+// 转发请求 goroutine 与额度刷新 goroutine 会并发读写 Account 的状态/额度字段，
+// 所有内存写入必须经下列方法（内部持 a.mu）执行；DB 落库由调用方跟进。
+
+// setRuntime 写状态 / 最近错误 / 冷却截止
+func (a *Account) setRuntime(status, lastError string, coolingUntil int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Status = status
+	a.LastError = lastError
+	a.CoolingUntil = coolingUntil
+}
+
+// bumpUse 记录一次成功使用；仅 cooling 恢复 active（exhausted 只能由额度刷新恢复）
+func (a *Account) bumpUse() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.UseCount++
+	a.LastUsedAt = time.Now().Unix()
+	if a.Status == StatusCooling {
+		a.Status = StatusActive
+		a.CoolingUntil = 0
+	}
+}
+
+// bumpFail 记录一次失败
+func (a *Account) bumpFail(lastError string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.FailCount++
+	a.LastError = lastError
+}
+
+// tryRecoverActive 额度刷新成功后将可恢复状态迁移回 active
+// （exhausted / inactive / invalid / 已到期的 cooling）；返回是否发生迁移
+func (a *Account) tryRecoverActive() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	switch {
+	case a.Status == StatusExhausted, a.Status == StatusInactive, a.Status == StatusInvalid:
+	case a.Status == StatusCooling && (a.CoolingUntil <= 0 || time.Now().Unix() >= a.CoolingUntil):
+	default:
+		return false
+	}
+	a.Status = StatusActive
+	a.CoolingUntil = 0
+	a.LastError = ""
+	return true
+}
+
+// setQuota 写额度快照字段
+func (a *Account) setQuota(quotaJSON, planTier, planExpire string, total, used, remaining float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.QuotaJSON = quotaJSON
+	a.PlanTier = planTier
+	a.PlanExpire = planExpire
+	a.TotalUnits = total
+	a.UsedUnits = used
+	a.Remaining = remaining
+	a.LastCheckedAt = time.Now().Unix()
+}
+
+// lastCheckedAt 读最近额度检查时间（锁保护；转发侧刷新节流判断用）
+func (a *Account) lastCheckedAt() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.LastCheckedAt
+}
+
+// statusError 读状态与最近错误（锁保护；转发侧失败提示用）
+func (a *Account) statusError() (string, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Status, a.LastError
+}
+
+// credentialSnapshot 锁保护地读取凭证三元组（供独立 goroutine 如异步 settle 使用，
+// 避免与 setCredentials 并发读写）
+func (a *Account) credentialSnapshot() (jwt, apiKey, deviceMid string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ZCodeJWT, a.APIKey, a.DeviceMid
+}
+
+// setCredentials 刷新成功后就地更新内存凭证（调用方持有该实例的独占使用权：
+// 每个请求/刷新 goroutine 的 Account 都是 ListAccounts 的独立副本）。
+// 不同步内存的话，同一次刷新流程后续的上游调用（如重置历史同步）仍会
+// 拿旧 JWT 打 401。
+func (a *Account) setCredentials(accessToken, refreshToken, zcodeJWT string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.AccessToken = accessToken
+	a.RefreshToken = refreshToken
+	a.ZCodeJWT = zcodeJWT
 }
 
 // GetAccount 按 ID 查询
@@ -147,9 +290,39 @@ func (db *DB) UpdateAccountFields(id int64, group, remark string, enabled bool) 
 	return err
 }
 
-// UpdateAccountTokens 更新凭证字段（OAuth 刷新 / 手动编辑）
+// UpdateAccountTokens 更新凭证字段（OAuth 刷新 / 手动编辑）；凭证列静态加密
+// UpdateAccountPriority 手动调整 priority 策略权重（0 回落默认 100）
+func (db *DB) UpdateAccountPriority(id int64, priority int64) error {
+	if priority <= 0 {
+		priority = DefaultPriority
+	}
+	_, err := db.conn.Exec(`UPDATE accounts SET priority = ?,
+		updated_at = datetime('now','localtime') WHERE id = ?`, priority, id)
+	return err
+}
+
 func (db *DB) UpdateAccountTokens(id int64, accessToken, refreshToken, zcodeJWT, apiKey, userInfo string) error {
-	_, err := db.conn.Exec(`
+	encAccess, err := vaultEncrypt(accessToken)
+	if err != nil {
+		return err
+	}
+	encRefresh, err := vaultEncrypt(refreshToken)
+	if err != nil {
+		return err
+	}
+	encJWT, err := vaultEncrypt(zcodeJWT)
+	if err != nil {
+		return err
+	}
+	encAPIKey, err := vaultEncrypt(apiKey)
+	if err != nil {
+		return err
+	}
+	encUserInfo, err := vaultEncrypt(userInfo)
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.Exec(`
 		UPDATE accounts SET
 			access_token  = COALESCE(NULLIF(?,''), access_token),
 			refresh_token = COALESCE(NULLIF(?,''), refresh_token),
@@ -157,7 +330,8 @@ func (db *DB) UpdateAccountTokens(id int64, accessToken, refreshToken, zcodeJWT,
 			api_key       = COALESCE(NULLIF(?,''), api_key),
 			user_info     = COALESCE(NULLIF(?,''), user_info),
 			updated_at = datetime('now','localtime')
-		WHERE id = ?`, accessToken, refreshToken, zcodeJWT, apiKey, userInfo, id)
+		WHERE id = ?`,
+		encAccess, encRefresh, encJWT, encAPIKey, encUserInfo, id)
 	return err
 }
 
@@ -180,11 +354,11 @@ func (db *DB) SetAccountQuota(id int64, quotaJSON, planTier, planExpire string, 
 	return err
 }
 
-// TouchAccountUse 记录一次成功使用
+// TouchAccountUse 记录一次成功使用（仅 cooling 恢复 active；exhausted 等额度刷新恢复）
 func (db *DB) TouchAccountUse(id int64) error {
 	_, err := db.conn.Exec(`
 		UPDATE accounts SET use_count = use_count + 1, last_used_at = ?,
-		status = CASE WHEN status IN ('cooling','exhausted') THEN 'active' ELSE status END,
+		status = CASE WHEN status = 'cooling' THEN 'active' ELSE status END,
 		cooling_until = 0,
 		updated_at = datetime('now','localtime') WHERE id = ?`, time.Now().Unix(), id)
 	return err

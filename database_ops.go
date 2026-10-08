@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -74,14 +75,33 @@ func (db *DB) DeleteClaimPlan(id int64) error {
 	return err
 }
 
-func (db *DB) UpdateClaimPlanRun(id int64, status, msg string) error {
+// UpdateClaimPlanRunAt 写计划运行状态，显式记录触发时间：
+// 执行完成时间 ≠ 触发分钟，按完成时间写会让每分钟计划在分钟边界处漏跑
+func (db *DB) UpdateClaimPlanRunAt(id int64, status, msg, runAt string) error {
 	_, err := db.conn.Exec(`
-		UPDATE claim_plans SET last_run_at=datetime('now','localtime'),
-		last_run_status=?, last_run_msg=? WHERE id=?`, status, msg, id)
+		UPDATE claim_plans SET last_run_at=?,
+		last_run_status=?, last_run_msg=? WHERE id=?`, runAt, status, msg, id)
 	return err
 }
 
 // ---- 活动领取记录 ----
+
+// HasResetRecordNear 是否已存在该账号 ±15 分钟内、同一重置类型（kind）的成功记录
+// （用于上游 used_at 去重：官方客户端等外部执行的重置不必重复入库。
+// 必须按 kind 区分：five_hour 与 week 背靠背消耗时互不构成重复）
+// 注意：created_at 存的是 localtime 墙钟字符串，strftime('%s') 会按 UTC 解析，
+// 需减去本地时区偏移才是真实 epoch。
+func (db *DB) HasResetRecordNear(accountID int64, usedAtSec int64, kind string) (bool, error) {
+	_, offset := time.Now().Zone()
+	var n int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(1) FROM claim_records
+		 WHERE account_id=? AND task_type='reset' AND success=1
+		   AND plan_name LIKE ?
+		   AND ABS(strftime('%s',created_at)-?-?)<900`,
+		accountID, "%("+kind+")%", offset, usedAtSec).Scan(&n)
+	return n > 0, err
+}
 
 func (db *DB) InsertClaimRecord(r *ClaimRecord) error {
 	_, err := db.conn.Exec(`
@@ -126,17 +146,20 @@ func (db *DB) ListClaimRecords(limit int, accountID int64) ([]*ClaimRecord, erro
 func (db *DB) InsertUsageRecord(r *UsageRecord) error {
 	_, err := db.conn.Exec(`
 		INSERT INTO usage_records (account_id, email, model, prompt_tokens, completion_tokens,
-			total_tokens, stream, status_code, duration_ms, ttft_ms)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			total_tokens, cache_read_tokens, cache_creation_tokens, stream, status_code,
+			duration_ms, ttft_ms, gateway_key_id, key_name)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.AccountID, r.Email, r.Model, r.PromptTokens, r.CompletionTokens,
-		r.TotalTokens, boolInt(r.Stream), r.StatusCode, r.DurationMs, r.TtftMs)
+		r.TotalTokens, r.CacheReadTokens, r.CacheCreationTokens, boolInt(r.Stream),
+		r.StatusCode, r.DurationMs, r.TtftMs, r.GatewayKeyID, r.KeyName)
 	return err
 }
 
 func (db *DB) ListUsageRecords(limit int) ([]*UsageRecord, error) {
 	rows, err := db.conn.Query(`
 		SELECT id, created_at, account_id, email, model, prompt_tokens, completion_tokens,
-		       total_tokens, stream, status_code, duration_ms, ttft_ms
+		       total_tokens, cache_read_tokens, cache_creation_tokens, stream, status_code,
+		       duration_ms, ttft_ms, gateway_key_id, key_name
 		FROM usage_records ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -147,8 +170,9 @@ func (db *DB) ListUsageRecords(limit int) ([]*UsageRecord, error) {
 		var r UsageRecord
 		var stream int
 		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.AccountID, &r.Email, &r.Model,
-			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &stream,
-			&r.StatusCode, &r.DurationMs, &r.TtftMs); err != nil {
+			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
+			&r.CacheReadTokens, &r.CacheCreationTokens, &stream,
+			&r.StatusCode, &r.DurationMs, &r.TtftMs, &r.GatewayKeyID, &r.KeyName); err != nil {
 			return nil, err
 		}
 		r.Stream = stream == 1
@@ -157,25 +181,46 @@ func (db *DB) ListUsageRecords(limit int) ([]*UsageRecord, error) {
 	return out, rows.Err()
 }
 
-// UsageStats 聚合统计（报表页）
+// UsageStats 聚合统计（报表页）：总量 / 缓存命中 / 成功率 / TTFT 分位 /
+// 按模型 / 按账号 / 按下游 Key / 按天趋势
 func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 	since := time.Now().AddDate(0, 0, -days).Format("2006-01-02 15:04:05")
 	out := map[string]interface{}{}
 	row := db.conn.QueryRow(`
 		SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
-		       COALESCE(SUM(total_tokens),0), COALESCE(AVG(duration_ms),0), COALESCE(AVG(NULLIF(ttft_ms,0)),0)
+		       COALESCE(SUM(total_tokens),0), COALESCE(SUM(cache_read_tokens),0),
+		       COALESCE(SUM(cache_creation_tokens),0),
+		       COALESCE(AVG(duration_ms),0), COALESCE(AVG(NULLIF(ttft_ms,0)),0),
+		       COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END),0)
 		FROM usage_records WHERE created_at >= ?`, since)
-	var n, pt, ct, tt int
+	var n, pt, ct, tt, crt, cct, ok int
 	var avgDur, avgTtft float64
-	if err := row.Scan(&n, &pt, &ct, &tt, &avgDur, &avgTtft); err != nil {
+	if err := row.Scan(&n, &pt, &ct, &tt, &crt, &cct, &avgDur, &avgTtft, &ok); err != nil {
 		return nil, err
 	}
 	out["requests"] = n
 	out["prompt_tokens"] = pt
 	out["completion_tokens"] = ct
 	out["total_tokens"] = tt
+	out["cache_read_tokens"] = crt
+	out["cache_creation_tokens"] = cct
 	out["avg_duration_ms"] = int(avgDur)
 	out["avg_ttft_ms"] = int(avgTtft)
+	if n > 0 {
+		out["success_rate"] = float64(ok) / float64(n)
+		// 缓存命中率 = 命中 token /（命中 + 新建 + 未缓存输入）
+		if denom := crt + cct + pt; denom > 0 {
+			out["cache_hit_rate"] = float64(crt) / float64(denom)
+		}
+	} else {
+		out["success_rate"] = 0.0
+		out["cache_hit_rate"] = 0.0
+	}
+	// TTFT 分位（非零样本，内存计算；7d 个人量级足够）
+	if ttfts, err := db.ttftSamples(since, 20000); err == nil && len(ttfts) > 0 {
+		out["p50_ttft_ms"] = percentile(ttfts, 0.5)
+		out["p95_ttft_ms"] = percentile(ttfts, 0.95)
+	}
 
 	// 按模型分布
 	models := map[string]int{}
@@ -209,7 +254,89 @@ func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 		}
 	}
 	out["by_account"] = accounts
+
+	// 按下游网关 Key 分布（R1）：请求数 + token 消耗（配额页展示用）
+	type keyAgg struct {
+		Requests int    `json:"requests"`
+		Tokens   int64  `json:"tokens"`
+		Name     string `json:"name"`
+	}
+	byKey := map[string]*keyAgg{}
+	rows3, err := db.conn.Query(`
+		SELECT COALESCE(NULLIF(key_name,''),'(root)'), gateway_key_id, COUNT(*), COALESCE(SUM(total_tokens),0)
+		FROM usage_records WHERE created_at >= ? GROUP BY gateway_key_id`, since)
+	if err == nil {
+		defer rows3.Close()
+		for rows3.Next() {
+			var name string
+			var kid, c int64
+			var tok int64
+			if rows3.Scan(&name, &kid, &c, &tok) == nil {
+				key := strconv.FormatInt(kid, 10)
+				agg, exists := byKey[key]
+				if !exists {
+					agg = &keyAgg{Name: name}
+					byKey[key] = agg
+				}
+				agg.Requests += int(c)
+				agg.Tokens += tok
+			}
+		}
+	}
+	out["by_gateway_key"] = byKey
+
+	// 按天趋势：请求数 / token / 缓存命中（前端图表）
+	type dayTrend struct {
+		Day       string `json:"day"`
+		Requests  int    `json:"requests"`
+		Tokens    int64  `json:"tokens"`
+		CacheRead int64  `json:"cache_read_tokens"`
+	}
+	var trend []dayTrend
+	rows4, err := db.conn.Query(`
+		SELECT date(created_at), COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cache_read_tokens),0)
+		FROM usage_records WHERE created_at >= ? GROUP BY date(created_at) ORDER BY date(created_at)`, since)
+	if err == nil {
+		defer rows4.Close()
+		for rows4.Next() {
+			var d dayTrend
+			var c int
+			if rows4.Scan(&d.Day, &c, &d.Tokens, &d.CacheRead) == nil {
+				d.Requests = c
+				trend = append(trend, d)
+			}
+		}
+	}
+	out["daily"] = trend
 	return out, nil
+}
+
+// ttftSamples 窗口内非零 TTFT 样本（升序返回，供分位计算）
+func (db *DB) ttftSamples(since string, cap int) ([]int, error) {
+	rows, err := db.conn.Query(`
+		SELECT ttft_ms FROM usage_records
+		WHERE created_at >= ? AND ttft_ms > 0 ORDER BY ttft_ms LIMIT ?`, since, cap)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int
+	for rows.Next() {
+		var v int
+		if rows.Scan(&v) == nil {
+			out = append(out, v)
+		}
+	}
+	return out, rows.Err()
+}
+
+// percentile 有序样本的最近秩分位
+func percentile(sorted []int, q float64) int {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(q * float64(len(sorted)-1))
+	return sorted[idx]
 }
 
 // ---- 代理节点 CRUD ----
@@ -240,23 +367,38 @@ func (db *DB) ListProxyNodes() ([]*ProxyNode, error) {
 }
 
 func (db *DB) SaveProxyNode(n *ProxyNode) (int64, error) {
+	// 清默认 + 写新默认必须同事务：清了不写会留下零默认节点，
+	// 写了不清会撞 idx_proxy_nodes_default 唯一约束
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
 	if n.IsDefault {
-		db.conn.Exec(`UPDATE proxy_nodes SET is_default = 0`)
+		if _, err := tx.Exec(`UPDATE proxy_nodes SET is_default = 0`); err != nil {
+			return 0, err
+		}
 	}
 	if n.ID > 0 {
-		_, err := db.conn.Exec(`
+		_, err := tx.Exec(`
 			UPDATE proxy_nodes SET name=?, type=?, host=?, port=?, username=?, password=?,
 			is_default=?, group_name=?, enabled=?, updated_at=datetime('now','localtime') WHERE id=?`,
 			n.Name, n.Type, n.Host, n.Port, n.Username, n.Password,
 			boolInt(n.IsDefault), n.GroupName, boolInt(n.Enabled), n.ID)
-		return n.ID, err
+		if err != nil {
+			return 0, err
+		}
+		return n.ID, tx.Commit()
 	}
-	res, err := db.conn.Exec(`
+	res, err := tx.Exec(`
 		INSERT INTO proxy_nodes (name, type, host, port, username, password, is_default, group_name, enabled)
 		VALUES (?,?,?,?,?,?,?,?,?)`,
 		n.Name, n.Type, n.Host, n.Port, n.Username, n.Password,
 		boolInt(n.IsDefault), n.GroupName, boolInt(n.Enabled))
 	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()

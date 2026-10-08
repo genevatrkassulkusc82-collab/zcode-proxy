@@ -1,6 +1,8 @@
 package main
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -34,11 +36,11 @@ type CronScheduler struct {
 	db   *DB
 	zapi *ZCodeAPI
 
-	stopCh  chan struct{}
+	stopCh   chan struct{}
 	stopOnce sync.Once
-	ticker  *time.Ticker
-	runMu   sync.Mutex
-	running map[int64]*PlanRunState
+	ticker   *time.Ticker
+	runMu    sync.Mutex
+	running  map[int64]*PlanRunState
 
 	execMu    sync.Mutex
 	execLocks map[int64]*sync.Mutex // per-plan 执行互斥（TryLock，拿不到跳过本 tick）
@@ -138,50 +140,72 @@ func (s *CronScheduler) checkAndRun() {
 		if !shouldRun(plan.CronExpr, now) {
 			continue
 		}
-		// 分钟级去重：本分钟已触发过则跳过（executePlan 开始时即写 last_run_at）
+		// 分钟级去重：本分钟已触发过则跳过（runPlan 以触发时间写 last_run_at）
 		if plan.LastRunAt != "" {
-			if lastRun, err := time.Parse("2006-01-02 15:04:05", plan.LastRunAt); err == nil {
+			// last_run_at 由 Go 按 '2006-01-02 15:04:05' 本地时间写入，按本地时区解析
+			if lastRun, err := time.ParseInLocation("2006-01-02 15:04:05", plan.LastRunAt, time.Local); err == nil {
 				if lastRun.Truncate(time.Minute).Equal(now.Truncate(time.Minute)) {
 					continue
 				}
 			}
 		}
-		go s.executePlan(plan)
+		go s.executePlan(plan, now)
 	}
 }
 
-// RunPlanNow 手动立即执行（UI 触发）；已在执行则拒绝排队
+// RunPlanNow 手动立即执行（UI 触发）；已在执行则拒绝排队。
+// 此处一次性获取计划锁并移交所有权给 goroutine，避免先放后抢的空窗被 cron tick 抢走导致静默不执行。
 func (s *CronScheduler) RunPlanNow(planID int64) error {
 	plan, err := s.db.GetClaimPlan(planID)
 	if err != nil {
-		return fmt.Errorf("计划不存在: %d", planID)
+		// 仅"真不存在"报不存在；DB 故障（锁/I/O）如实上抛，避免误导成 404
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("计划不存在: %d", planID)
+		}
+		return fmt.Errorf("计划查询失败: %w", err)
 	}
-	if !s.planLock(planID).TryLock() {
+	lock := s.planLock(planID)
+	if !lock.TryLock() {
 		return fmt.Errorf("计划正在执行中，请稍后再试")
 	}
-	s.planLock(planID).Unlock()
-	go s.executePlan(plan)
+	go func() {
+		defer lock.Unlock()
+		s.runPlan(plan, time.Now())
+	}()
 	return nil
 }
 
-// executePlan 执行计划（解析目标账号集合）
-func (s *CronScheduler) executePlan(plan *ClaimPlan) {
+// executePlan 执行计划（cron 路径；已有执行在跑则静默跳过，不排队堆积）。
+// triggered 为本次触发的 tick 时间——last_run_at 记它而非执行完成时间，
+// 否则跨分钟的执行会让下一分钟的 tick 误判为已跑过而漏跑
+func (s *CronScheduler) executePlan(plan *ClaimPlan, triggered time.Time) {
 	lock := s.planLock(plan.ID)
 	if !lock.TryLock() {
-		return // 已有执行在跑，跳过（不排队堆积）
+		return
 	}
 	defer lock.Unlock()
+	s.runPlan(plan, triggered)
+}
 
-	// 开始即写 last_run_at，避免长计划期间被重复触发
-	s.db.UpdateClaimPlanRun(plan.ID, "running", "执行中")
+// runPlan 执行计划体（调用方持有计划锁并负责释放；解析目标账号集合）
+func (s *CronScheduler) runPlan(plan *ClaimPlan, triggered time.Time) {
+	runAt := triggered.Format("2006-01-02 15:04:05")
+	// 开始即写触发时间，避免长计划期间被重复触发
+	if err := s.db.UpdateClaimPlanRunAt(plan.ID, "running", "执行中", runAt); err != nil {
+		log.Printf("[scheduler] plan #%d write last_run_at: %v（写失败可能导致同分钟重复触发）", plan.ID, err)
+	}
 
 	targets, err := s.resolveTargets(plan)
 	if err != nil {
-		s.db.UpdateClaimPlanRun(plan.ID, "failed", err.Error())
+		if err := s.db.UpdateClaimPlanRunAt(plan.ID, "failed", err.Error(), runAt); err != nil {
+			log.Printf("[scheduler] plan #%d write run state: %v", plan.ID, err)
+		}
 		return
 	}
 	if len(targets) == 0 {
-		s.db.UpdateClaimPlanRun(plan.ID, "failed", "没有符合条件的账号")
+		if err := s.db.UpdateClaimPlanRunAt(plan.ID, "failed", "没有符合条件的账号", runAt); err != nil {
+			log.Printf("[scheduler] plan #%d write run state: %v", plan.ID, err)
+		}
 		return
 	}
 
@@ -231,17 +255,20 @@ func (s *CronScheduler) executePlan(plan *ClaimPlan) {
 		status = "failed"
 	}
 	summary := fmt.Sprintf("%d/%d 成功: %s", successCount, len(targets), strings.Join(results, "; "))
-	if len(summary) > 900 {
-		summary = summary[:900] + "…"
-	}
+	// rune 安全截断：中文 3 字节/符，按字节切会切碎 UTF-8 尾巴
+	summary = truncate(summary, 900)
 	duration := int(time.Since(start).Milliseconds())
-	s.db.UpdateClaimPlanRun(plan.ID, status, summary)
-	s.db.InsertPlanRunRecord(&PlanRunRecord{
+	if err := s.db.UpdateClaimPlanRunAt(plan.ID, status, summary, runAt); err != nil {
+		log.Printf("[scheduler] plan #%d write run state: %v", plan.ID, err)
+	}
+	if err := s.db.InsertPlanRunRecord(&PlanRunRecord{
 		PlanID: plan.ID, PlanName: plan.PlanName, TaskType: taskType,
 		TargetType: plan.TargetType, Status: status, Message: summary,
 		Total: len(targets), SuccessCount: successCount, FailCount: failCount,
 		DurationMs: duration,
-	})
+	}); err != nil {
+		log.Printf("[scheduler] plan #%d insert run record: %v", plan.ID, err)
+	}
 	log.Printf("[scheduler] plan #%d done: %s", plan.ID, status)
 }
 
@@ -253,33 +280,67 @@ func (s *CronScheduler) resolveTargets(plan *ClaimPlan) ([]*Account, error) {
 		if err != nil {
 			return nil, err
 		}
-		return []*Account{a}, nil
+		// 单账号目标同样受可执行过滤：管理员禁用/无 JWT 的账号不得被
+		// cron 自动领活动/消耗重置机会
+		runnable := filterRunnableFor(taskTypeOf(plan), []*Account{a})
+		if len(runnable) == 0 {
+			return nil, fmt.Errorf("目标账号不可执行（已禁用/无效或缺少 JWT）")
+		}
+		return runnable, nil
 	case "group":
 		if plan.AccountGroup == "" {
 			return nil, fmt.Errorf("分组目标缺少组名")
 		}
-		all, err := s.db.ListAccounts(plan.AccountGroup)
+		all, err := s.db.ListAccounts("")
 		if err != nil {
 			return nil, err
 		}
-		return filterRunnable(all), nil
+		// 逗号分隔多组的账号（ListGroups 同约定）按组名逐段匹配
+		var inGroup []*Account
+		for _, a := range all {
+			if matchAccountGroup(a, plan.AccountGroup) {
+				inGroup = append(inGroup, a)
+			}
+		}
+		return s.filterAndReport(plan, inGroup), nil
 	default: // all_accounts
 		all, err := s.db.ListAccounts("")
 		if err != nil {
 			return nil, err
 		}
-		return filterRunnable(all), nil
+		return s.filterAndReport(plan, all), nil
 	}
 }
 
-// filterRunnable 过滤可执行任务的账号：启用 + 非 invalid/disabled + 有 JWT
-func filterRunnable(in []*Account) []*Account {
+// filterAndReport 过滤可执行账号并对被剔除的账号留痕——静默丢弃会让
+// "5/5 成功"掩盖实际存在但被跳过的账号
+func (s *CronScheduler) filterAndReport(plan *ClaimPlan, all []*Account) []*Account {
+	runnable := filterRunnableFor(taskTypeOf(plan), all)
+	if dropped := len(all) - len(runnable); dropped > 0 {
+		log.Printf("[scheduler] plan #%d %s: %d account(s) skipped (disabled/invalid/no JWT)",
+			plan.ID, plan.PlanName, dropped)
+	}
+	return runnable
+}
+
+// taskTypeOf 计划任务类型（空缺省 claim）
+func taskTypeOf(plan *ClaimPlan) string {
+	if plan.TaskType == "" {
+		return "claim"
+	}
+	return plan.TaskType
+}
+
+// filterRunnableFor 过滤可执行任务的账号：启用 + 非 invalid/disabled + 有 JWT。
+// claim/detect/activate/reset 都以 JWT 通道为主路径，无 JWT 的账号交给它们
+// 只会每次运行记一条失败。
+func filterRunnableFor(taskType string, in []*Account) []*Account {
 	var out []*Account
 	for _, a := range in {
 		if !a.Enabled || a.Status == StatusDisabled || a.Status == StatusInvalid {
 			continue
 		}
-		if a.ZCodeJWT == "" && a.APIKey == "" {
+		if a.ZCodeJWT == "" {
 			continue
 		}
 		out = append(out, a)
@@ -295,7 +356,11 @@ func (s *CronScheduler) executeTask(taskType string, a *Account) *ClaimResult {
 	case "activate":
 		return s.zapi.ActivateForAccount(a)
 	case "reset":
-		return s.zapi.ResetForAccount(a)
+		// 重置仅手动触发：自动消耗 5h/周重置窗口可能把宝贵机会浪费在
+		// 不需要的时刻。按策略 cron 计划一律拒绝执行 reset，
+		// 手动入口（POST /api/accounts/{id}/reset）不受影响。
+		log.Printf("[scheduler] reset task refused for %s: resets are manual-only", a.DisplayNameOrEmail())
+		return &ClaimResult{Code: -1, Message: "重置已改为仅手动触发：计划不再自动执行 reset"}
 	default: // claim
 		return s.zapi.ClaimForAccount(a)
 	}
@@ -309,31 +374,61 @@ func shouldRun(cronExpr string, now time.Time) bool {
 	if len(fields) != 5 {
 		return false
 	}
-	return matchField(fields[0], now.Minute(), 0, 59) &&
-		matchField(fields[1], now.Hour(), 0, 23) &&
-		matchField(fields[2], now.Day(), 1, 31) &&
-		matchField(fields[3], int(now.Month()), 1, 12) &&
-		matchField(fields[4], int(now.Weekday()), 0, 6)
+	if !matchField(fields[0], now.Minute(), 0, 59) ||
+		!matchField(fields[1], now.Hour(), 0, 23) ||
+		!matchField(fields[3], int(now.Month()), 1, 12) {
+		return false
+	}
+	// 标准 cron 语义：日与周均受限（非 *）时任一匹配即触发；否则按 AND
+	domOK := matchField(fields[2], now.Day(), 1, 31)
+	dowOK := matchField(fields[4], int(now.Weekday()), 0, 6)
+	if !isCronStarField(fields[2]) && !isCronStarField(fields[4]) {
+		return domOK || dowOK
+	}
+	return domOK && dowOK
+}
+
+// isCronStarField 该字段是否"未受限"（决定 日/周 的 AND/OR 组合）。
+// 语义：* 与 */n 前缀算星号位（与 vixie 的首字符判定一致）；含裸 * 的列表
+// 也视为未受限（此处比 vixie 的首字符规则更符合直觉：vixie 会把 "9,*"
+// 当受限字段）。主流表达式两者一致；分歧仅在混合星号列表这种罕见写法。
+func isCronStarField(field string) bool {
+	if field == "*" || strings.HasPrefix(field, "*/") {
+		return true
+	}
+	if strings.Contains(field, ",") {
+		for _, p := range strings.Split(field, ",") {
+			if strings.TrimSpace(p) == "*" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func matchField(field string, value, min, max int) bool {
 	if field == "*" {
 		return true
 	}
-	if strings.HasPrefix(field, "*/") {
-		step, err := strconv.Atoi(field[2:])
-		if err != nil || step <= 0 {
-			return false
-		}
-		return value%step == 0
-	}
+	// 逗号分支必须在 */ 前缀分支之前：否则 "*/3,15" 被当成步进值 "3,15"
+	// 解析失败，表达式通过校验却永远不触发（与 validateCronField 同序）
 	if strings.Contains(field, ",") {
+		// 列表内每部分递归回 matchField：支持 "1-5,20"、"*/3,15" 等混合写法
 		for _, p := range strings.Split(field, ",") {
-			if matchSinglePart(p, value) {
+			if matchField(strings.TrimSpace(p), value, min, max) {
 				return true
 			}
 		}
 		return false
+	}
+	if strings.HasPrefix(field, "*/") {
+		// 与 matchStep 同一锚点语义：*/n 从字段下限起算（日域 1,1+n,1+2n…），
+		// 而非 value%n==0（会得到 5,10,15… 且月末不齐）
+		step, err := strconv.Atoi(field[2:])
+		if err != nil || step <= 0 {
+			return false
+		}
+		return (value-min)%step == 0
 	}
 	if strings.Contains(field, "/") {
 		return matchStep(field, value, min, max)
@@ -429,6 +524,16 @@ func validateCronField(field string, min, max int) error {
 	if field == "*" {
 		return nil
 	}
+	// 先拆列表再验每部分（与 matchField 的 ,优先 顺序一致）：
+	// 否则 "*/3,15" 会被当成步进值 "3,15" 而误拒
+	if strings.Contains(field, ",") {
+		for _, p := range strings.Split(field, ",") {
+			if err := validateCronField(p, min, max); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if strings.Contains(field, "/") {
 		parts := strings.SplitN(field, "/", 2)
 		if len(parts) != 2 {
@@ -443,14 +548,6 @@ func validateCronField(field string, min, max int) error {
 			return nil
 		}
 		return validateCronField(rangePart, min, max)
-	}
-	if strings.Contains(field, ",") {
-		for _, p := range strings.Split(field, ",") {
-			if err := validateCronField(p, min, max); err != nil {
-				return err
-			}
-		}
-		return nil
 	}
 	if strings.Contains(field, "-") {
 		parts := strings.SplitN(field, "-", 2)

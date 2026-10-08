@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -15,6 +16,11 @@ import (
 // user_id 为自然键：重复导入同一账号时按 user_id upsert，
 // device_mid / credentials_raw 一旦写入不会被后续导入清空（COALESCE 保留）。
 type Account struct {
+	// mu 串行化下方运行时可变字段的写入：转发请求与额度刷新 goroutine 并发读写
+	// （状态/冷却/错误/额度快照/Use-Fail 计数，见 database_accounts.go 的写入方法）。
+	// Account 一律以指针传递，禁止按值复制。
+	mu sync.Mutex
+
 	ID          int64  `json:"id"`
 	UserID      string `json:"user_id"`      // 自然键（JWT user_id / user_info.id）
 	Email       string `json:"email"`        // 登录邮箱
@@ -22,20 +28,21 @@ type Account struct {
 	Provider    string `json:"provider"`     // zai | bigmodel
 	AuthType    string `json:"auth_type"`    // jwt | apikey
 
-	AccessToken  string `json:"-"` // OAuth access_token（JWT，内含 api_key claim）
-	RefreshToken string `json:"-"` // OAuth refresh_token
-	ZCodeJWT     string `json:"-"` // Coding Plan JWT（zcode.z.ai 免费通道凭证）
-	APIKey       string `json:"-"` // api.z.ai 通道密钥（{api_key}.{secret_key}）
-	UserInfo     string `json:"-"` // 原始 user_info JSON
-	DeviceMid    string `json:"device_mid"`     // X-Device-Mid（设备指纹，永不被重导入覆盖）
-	CredsRaw     string `json:"-"`              // 本地客户端 credentials.json 原始内容（供一键切回）
+	AccessToken  string `json:"-"`          // OAuth access_token（JWT，内含 api_key claim）
+	RefreshToken string `json:"-"`          // OAuth refresh_token
+	ZCodeJWT     string `json:"-"`          // Coding Plan JWT（zcode.z.ai 免费通道凭证）
+	APIKey       string `json:"-"`          // api.z.ai 通道密钥（{api_key}.{secret_key}）
+	UserInfo     string `json:"-"`          // 原始 user_info JSON
+	DeviceMid    string `json:"device_mid"` // X-Device-Mid（设备指纹，永不被重导入覆盖）
+	CredsRaw     string `json:"-"`          // 本地客户端 credentials.json 原始内容（供一键切回）
 
-	Status       string `json:"status"`        // active|exhausted|cooling|invalid|disabled|inactive
-	Enabled      bool   `json:"enabled"`       // 是否参与轮询
-	AccountGroup string `json:"group"`         // 分组（空=未分组）
-	QuotaJSON    string `json:"-"`             // 最近一次额度快照（规范化 JSON）
-	PlanTier     string `json:"plan_tier"`     // Start Plan / Lite / Pro / Max / 体验
-	PlanExpire   string `json:"plan_expire"`   // 套餐到期时间（展示用字符串）
+	Status       string  `json:"status"`      // active|exhausted|cooling|invalid|disabled|inactive
+	Enabled      bool    `json:"enabled"`     // 是否参与轮询
+	AccountGroup string  `json:"group"`       // 分组（空=未分组）
+	Priority     int64   `json:"priority"`    // priority 策略：数值小者优先（50=促销/免费层默认，100=普通默认）
+	QuotaJSON    string  `json:"-"`           // 最近一次额度快照（规范化 JSON）
+	PlanTier     string  `json:"plan_tier"`   // Start Plan / Lite / Pro / Max / 体验
+	PlanExpire   string  `json:"plan_expire"` // 套餐到期时间（展示用字符串）
 	TotalUnits   float64 `json:"total_units"`
 	UsedUnits    float64 `json:"used_units"`
 	Remaining    float64 `json:"remaining"`
@@ -60,14 +67,14 @@ type Account struct {
 type ClaimPlan struct {
 	ID            int64  `json:"id"`
 	PlanName      string `json:"plan_name"`
-	CronExpr      string `json:"cron_expr"`      // 5 段: 分 时 日 月 周
+	CronExpr      string `json:"cron_expr"` // 5 段: 分 时 日 月 周
 	IsActive      bool   `json:"is_active"`
-	TargetType    string `json:"target_type"`    // all_accounts | single_account | group
-	AccountID     int64  `json:"account_id"`     // single_account 时有效
-	AccountGroup  string `json:"account_group"`  // group 时有效
-	TaskType      string `json:"task_type"`      // detect | claim | activate
-	AutoPick      bool   `json:"auto_pick"`      // claim 时自动选优先级最高的活动
-	DelaySeconds  int    `json:"delay_seconds"`  // 多账号间隔秒数（防风控）
+	TargetType    string `json:"target_type"`   // all_accounts | single_account | group
+	AccountID     int64  `json:"account_id"`    // single_account 时有效
+	AccountGroup  string `json:"account_group"` // group 时有效
+	TaskType      string `json:"task_type"`     // detect | claim | activate
+	AutoPick      bool   `json:"auto_pick"`     // claim 时自动选优先级最高的活动
+	DelaySeconds  int    `json:"delay_seconds"` // 多账号间隔秒数（防风控）
 	LastRunAt     string `json:"last_run_at"`
 	LastRunStatus string `json:"last_run_status"`
 	LastRunMsg    string `json:"last_run_msg"`
@@ -77,33 +84,37 @@ type ClaimPlan struct {
 
 // ClaimRecord 活动领取记录
 type ClaimRecord struct {
-	ID         int64  `json:"id"`
-	CreatedAt  string `json:"created_at"`
-	AccountID  int64  `json:"account_id"`
-	Email      string `json:"email"`
-	TaskType   string `json:"task_type"` // detect | claim | activate
-	PlanID     string `json:"plan_id"`
-	PlanName   string `json:"plan_name"`
-	Success    bool   `json:"success"`
-	Code       int    `json:"code"`
-	Message    string `json:"message"`
-	NextAt     int64  `json:"next_at"` // 1005 名额用完时的下次可领时间 epoch 毫秒
+	ID        int64  `json:"id"`
+	CreatedAt string `json:"created_at"`
+	AccountID int64  `json:"account_id"`
+	Email     string `json:"email"`
+	TaskType  string `json:"task_type"` // detect | claim | activate
+	PlanID    string `json:"plan_id"`
+	PlanName  string `json:"plan_name"`
+	Success   bool   `json:"success"`
+	Code      int    `json:"code"`
+	Message   string `json:"message"`
+	NextAt    int64  `json:"next_at"` // 1005 名额用完时的下次可领时间 epoch 毫秒
 }
 
 // UsageRecord API 使用记录
 type UsageRecord struct {
-	ID               int64  `json:"id"`
-	CreatedAt        string `json:"created_at"`
-	AccountID        int64  `json:"account_id"`
-	Email            string `json:"email"`
-	Model            string `json:"model"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	TotalTokens      int    `json:"total_tokens"`
-	Stream           bool   `json:"stream"`
-	StatusCode       int    `json:"status_code"`
-	DurationMs       int    `json:"duration_ms"`
-	TtftMs           int    `json:"ttft_ms"`
+	ID                 int64  `json:"id"`
+	CreatedAt          string `json:"created_at"`
+	AccountID          int64  `json:"account_id"`
+	Email              string `json:"email"`
+	Model              string `json:"model"`
+	PromptTokens       int    `json:"prompt_tokens"`
+	CompletionTokens   int    `json:"completion_tokens"`
+	TotalTokens        int    `json:"total_tokens"`
+	CacheReadTokens    int    `json:"cache_read_tokens"`
+	CacheCreationTokens int   `json:"cache_creation_tokens"`
+	Stream             bool   `json:"stream"`
+	StatusCode         int    `json:"status_code"`
+	DurationMs         int    `json:"duration_ms"`
+	TtftMs             int    `json:"ttft_ms"`
+	GatewayKeyID       int64  `json:"gateway_key_id"`
+	KeyName            string `json:"key_name"`
 }
 
 // ProxyNode 出口代理节点（组绑定）
@@ -147,6 +158,12 @@ type PlanRunRecord struct {
 // DB 持有数据库连接
 type DB struct {
 	conn *sql.DB
+
+	// 设置项读缓存（TTL 见 database_settings.go）：转发热路径每请求读
+	// fingerprint/sticky/strategy 等多个设置，逐条 SQLite 查询是纯开销。
+	// 仅进程内缓存；外部直改 sqlite 最迟 3s 生效。
+	setMu    sync.Mutex
+	setCache map[string]settingsCacheEntry
 }
 
 // NewDB 打开/创建 SQLite 数据库并初始化 schema
@@ -161,6 +178,8 @@ func NewDB(dbPath string) (*DB, error) {
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA busy_timeout=5000",
 		"PRAGMA foreign_keys=ON",
+		// 凭证迁移/删除后，空闲页中的明文残留要在释放时即被清零
+		"PRAGMA secure_delete=ON",
 	}
 	for _, p := range pragmas {
 		if _, err := conn.Exec(p); err != nil {
@@ -173,6 +192,28 @@ func NewDB(dbPath string) (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
+	// 凭证加密种子解析（keyfile 生成/轮换）必须先于任何账号读写
+	ResolveVaultSeed(db, dbPath)
+	// priority 列增量迁移（旧库无此列；已存在时报错忽略）
+	if _, err := db.conn.Exec(`ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 100`); err == nil {
+		log.Printf("[db] added accounts.priority column (default 100)")
+	}
+	// usage_records 增量迁移：缓存 token 计量（R3）+ 命名网关 Key 归因（R1）
+	for _, col := range []string{
+		`ALTER TABLE usage_records ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN gateway_key_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN key_name TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.conn.Exec(col); err == nil {
+			log.Printf("[db] %s", col)
+		}
+	}
+	// 存量明文凭证列静态加密迁移（幂等；失败不阻断启动，下轮再试）
+	if err := db.MigrateVault(); err != nil {
+		log.Printf("[vault] migrate: %v", err)
+	}
+	db.ProbeVaultHealth()
 	return db, nil
 }
 
@@ -320,14 +361,29 @@ func (db *DB) initSchema() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_plan_run_records_run_at ON plan_run_records(run_at);
 	CREATE INDEX IF NOT EXISTS idx_plan_run_records_plan   ON plan_run_records(plan_id);
+
+	CREATE TABLE IF NOT EXISTS gateway_keys (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		name        TEXT DEFAULT '',
+		key_hash    TEXT NOT NULL UNIQUE,
+		key_prefix  TEXT DEFAULT '',
+		enabled     INTEGER DEFAULT 1,
+		rpm_limit   INTEGER DEFAULT 0,
+		quota_total INTEGER DEFAULT 0,
+		quota_used  INTEGER DEFAULT 0,
+		models      TEXT DEFAULT '',
+		last_used_at INTEGER DEFAULT 0,
+		created_at  TEXT DEFAULT (datetime('now','localtime')),
+		updated_at  TEXT DEFAULT (datetime('now','localtime'))
+	);
 	`
 	if _, err := db.conn.Exec(schema); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
-	// 默认设置项
+	// 默认设置项。注意 is_default_password 不在此播种：该标记只由认证引导
+	// 显式写入（随机口令生成时置 1，修改口令时清 0），无标记 = 非缺省口令
 	defaults := map[string]string{
 		"admin_user":             "admin",
-		"is_default_password":    "1",
 		"api_key":                "",
 		"selection_strategy":     "round_robin",
 		"quota_refresh_interval": "60",
@@ -337,6 +393,18 @@ func (db *DB) initSchema() error {
 		"custom_ja3":             "",
 		"captcha_mode":           "auto",
 		"gateway_models":         "",
+		// R5 prompt-cache 断点默认关闭（上游各通道对 cache_control 支持未全量实测）
+		"prompt_cache_breakpoint": "0",
+		// 速度：验证参数后台保温，转发零求解等待
+		"captcha_prewarm": "1",
+		// 自动领取促销活动（只领活动，绝不自动消耗重置）
+		"auto_claim_promos":           "1",
+		"auto_claim_interval_minutes": "30",
+		"auto_claim_delay_seconds":    "10",
+		// 自动重置策略：默认关闭；开启后仅在"耗尽 && 自然窗口等待 > 阈值"时消耗
+		"auto_reset_enabled":           "0",
+		"auto_reset_min_wait_minutes":  "60",
+		"auto_reset_min_wait_week_hours": "24",
 	}
 	for k, v := range defaults {
 		if _, err := db.conn.Exec(

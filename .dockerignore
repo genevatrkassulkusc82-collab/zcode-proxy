@@ -1,0 +1,17 @@
+# Runtime state and secrets — bind-mounted at run time, never baked into the image
+data/
+config/
+*.db
+*.db-shm
+*.db-wal
+*.key
+
+# Version control and CI
+.git
+.github
+
+# Local backups
+backups/
+
+# OS noise
+.DS_Store

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -37,8 +38,7 @@ type localClientFiles struct {
 	cache       string // ~/.zcode/v2/coding-plan-cache.json
 }
 
-func resolveLocalClientFiles() localClientFiles {
-	home, _ := os.UserHomeDir()
+func localClientFilesFor(home string) localClientFiles {
 	v2 := filepath.Join(home, ".zcode", "v2")
 	return localClientFiles{
 		home:        home,
@@ -49,11 +49,88 @@ func resolveLocalClientFiles() localClientFiles {
 	}
 }
 
-// ImportFromLocalClient 从本机 ZCode 客户端导入当前登录账号。
+func resolveLocalClientFiles() localClientFiles {
+	home, _ := os.UserHomeDir()
+	return localClientFilesFor(home)
+}
+
+// ImportFromLocalClient 从本机 ZCode 客户端导入当前登录账号，
+// 并顺带扫描多实例凭证目录（~/.zcode-multi、macOS Application Support）。
+func (m *AccountManager) ImportFromLocalClient(group string) (*Account, error) {
+	a, err := m.importLocalClient(resolveLocalClientFiles(), group, "本地客户端导入")
+	if err != nil {
+		return nil, err
+	}
+	// 多实例扫描失败不影响主导入（fail-soft）
+	scanned, found, imported := m.ImportMultiInstanceClients(group)
+	if scanned > 0 {
+		log.Printf("[import] multi-instance scan: scanned=%d found=%d imported=%d", scanned, found, imported)
+	}
+	return a, nil
+}
+
+// ImportMultiInstanceClients 扫描多实例 ZCode 客户端凭证并导入。
+// 布局：<home>/.zcode-multi/<实例>/v2/credentials.json，darwin 另有
+// ~/Library/Application Support/zcode-multi/<实例>/v2/credentials.json。
+// 每个实例走与主导入完全相同的解密/导入路径（实例目录即密钥推导 home）；
+// user_id 自然键 upsert 使重复导入幂等（同一用户多实例自然合并）。
+// 返回：扫描的实例数 / 含可解析凭证的实例数 / 成功入库的实例数。
+func (m *AccountManager) ImportMultiInstanceClients(group string) (scanned, found, imported int) {
+	home, _ := os.UserHomeDir()
+	patterns := []string{
+		filepath.Join(home, ".zcode-multi", "*", "v2", "credentials.json"),
+	}
+	if runtime.GOOS == "darwin" {
+		patterns = append(patterns,
+			filepath.Join(home, "Library", "Application Support", "zcode-multi", "*", "v2", "credentials.json"))
+	}
+	seen := map[string]bool{}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern) // glob 出错按零结果处理（fail-soft）
+		if err != nil {
+			continue
+		}
+		for _, credPath := range matches {
+			if seen[credPath] {
+				continue
+			}
+			seen[credPath] = true
+			scanned++
+			data, err := os.ReadFile(credPath)
+			if err != nil {
+				continue
+			}
+			var creds map[string]string
+			if json.Unmarshal(data, &creds) != nil || len(creds) == 0 {
+				continue
+			}
+			found++
+			// credPath = <实例>/v2/credentials.json，v2 上级即实例目录
+			v2Dir := filepath.Dir(credPath)
+			instanceDir := filepath.Dir(v2Dir)
+			f := localClientFiles{
+				home:        instanceDir, // 多实例凭证以实例目录推导密钥
+				credentials: credPath,
+				config:      filepath.Join(v2Dir, "config.json"),
+				telemetry:   filepath.Join(v2Dir, "telemetry-state.json"),
+				cache:       filepath.Join(v2Dir, "coding-plan-cache.json"),
+			}
+			if _, err := m.importLocalClient(f, group,
+				"多实例导入: "+filepath.Base(instanceDir)); err != nil {
+				log.Printf("[import] instance %s: %v", filepath.Base(instanceDir), err)
+				continue
+			}
+			imported++
+		}
+	}
+	return scanned, found, imported
+}
+
+// importLocalClient 从给定 localClientFiles（凭证/配置/遥测文件组）导入账号。
 // 解密 credentials.json 提取 JWT/access_token/user_info；
 // 从 config.json 提取 coding-plan API Key；保留原始文件内容供一键切回。
-func (m *AccountManager) ImportFromLocalClient(group string) (*Account, error) {
-	f := resolveLocalClientFiles()
+// f.home 仅用作凭证密钥推导基准（主导入=用户主目录，多实例=实例目录）。
+func (m *AccountManager) importLocalClient(f localClientFiles, group, remark string) (*Account, error) {
 	credData, err := os.ReadFile(f.credentials)
 	if err != nil {
 		return nil, fmt.Errorf("读取本地凭证失败（ZCode 客户端可能未安装/未登录）: %w", err)
@@ -153,21 +230,21 @@ func (m *AccountManager) ImportFromLocalClient(group string) (*Account, error) {
 	snapshotJSON, _ := json.Marshal(snapshot)
 
 	a := &Account{
-		UserID:      userID,
-		Email:       email,
-		DisplayName: displayName,
-		Provider:    provider,
-		AuthType:    "jwt",
-		AccessToken: accessToken,
-		ZCodeJWT:    zcodeJWT,
-		APIKey:      apiKey,
-		UserInfo:    userInfo,
-		DeviceMid:   deviceMid,
-		CredsRaw:    string(snapshotJSON),
-		Status:      StatusActive,
-		Enabled:     true,
+		UserID:       userID,
+		Email:        email,
+		DisplayName:  displayName,
+		Provider:     provider,
+		AuthType:     "jwt",
+		AccessToken:  accessToken,
+		ZCodeJWT:     zcodeJWT,
+		APIKey:       apiKey,
+		UserInfo:     userInfo,
+		DeviceMid:    deviceMid,
+		CredsRaw:     string(snapshotJSON),
+		Status:       StatusActive,
+		Enabled:      true,
 		AccountGroup: group,
-		Remark:      "本地客户端导入",
+		Remark:       remark,
 	}
 	if zcodeJWT == "" {
 		a.AuthType = "apikey"
@@ -177,6 +254,7 @@ func (m *AccountManager) ImportFromLocalClient(group string) (*Account, error) {
 		return nil, fmt.Errorf("账号入库失败: %w", err)
 	}
 	a.ID = id
+	m.ensureAccountIdentity(a)
 	log.Printf("[import] local client account imported: %s (id=%d, jwt=%v, apikey=%v)",
 		email, id, zcodeJWT != "", apiKey != "")
 
@@ -256,6 +334,7 @@ func (m *AccountManager) ImportPasted(provider, name, secret, group string) (*Ac
 		return nil, fmt.Errorf("账号入库失败: %w", err)
 	}
 	a.ID = id
+	m.ensureAccountIdentity(a)
 
 	go func() {
 		time.Sleep(500 * time.Millisecond)
@@ -282,13 +361,23 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	f := resolveLocalClientFiles()
 	secret := DefaultCredentialSecret(f.home)
 
-	// 1. 备份（基于可执行文件目录，避免受工作目录影响）
+	// 1. 备份（基于可执行文件目录，避免受工作目录影响）。
+	// 备份是切回的唯一可逆手段：备份失败必须中止，不得先覆盖线上凭证
 	backupDir := filepath.Join(exeDir(), "data", "backups")
-	os.MkdirAll(backupDir, 0755)
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return fmt.Errorf("创建备份目录失败: %w", err)
+	}
 	stamp := time.Now().Format("20060102-150405")
 	for _, p := range []string{f.credentials, f.config} {
 		if data, err := os.ReadFile(p); err == nil {
-			os.WriteFile(filepath.Join(backupDir, filepath.Base(p)+"."+stamp+".bak"), data, 0644)
+			// 备份含凭证快照，限权 0600（WriteFile 对已存在文件不改权限，补一次 Chmod）
+			bak := filepath.Join(backupDir, filepath.Base(p)+"."+stamp+".bak")
+			if err := os.WriteFile(bak, data, 0600); err != nil {
+				return fmt.Errorf("备份 %s 失败: %w", filepath.Base(p), err)
+			}
+			if err := os.Chmod(bak, 0600); err != nil {
+				return fmt.Errorf("收紧备份权限失败: %w", err)
+			}
 		}
 	}
 
@@ -306,22 +395,34 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	}
 	enc := func(plain string) (string, error) { return EncryptCredential(plain, secret) }
 
-	if v, err := enc(a.ZCodeJWT); err == nil {
-		creds["zcodejwttoken"] = v
+	// 全部加密成功才动笔：部分成功会写出一个"旧登录态 + 新计费键"的混合身份
+	var zcodeEnc, accessEnc, userEnc, providerEnc string
+	var encErr error
+	if zcodeEnc, encErr = enc(a.ZCodeJWT); encErr != nil {
+		return fmt.Errorf("加密 zcodejwttoken 失败: %w", encErr)
 	}
 	if a.AccessToken != "" {
-		if v, err := enc(a.AccessToken); err == nil {
-			creds["oauth:"+provider+":access_token"] = v
+		if accessEnc, encErr = enc(a.AccessToken); encErr != nil {
+			return fmt.Errorf("加密 access_token 失败: %w", encErr)
 		}
 	}
 	if a.UserInfo != "" {
-		if v, err := enc(a.UserInfo); err == nil {
-			creds["oauth:"+provider+":user_info"] = v
+		if userEnc, encErr = enc(a.UserInfo); encErr != nil {
+			return fmt.Errorf("加密 user_info 失败: %w", encErr)
 		}
 	}
-	if v, err := enc(provider); err == nil {
-		creds["oauth:active_provider"] = v
+	if providerEnc, encErr = enc(provider); encErr != nil {
+		return fmt.Errorf("加密 provider 失败: %w", encErr)
 	}
+
+	creds["zcodejwttoken"] = zcodeEnc
+	if accessEnc != "" {
+		creds["oauth:"+provider+":access_token"] = accessEnc
+	}
+	if userEnc != "" {
+		creds["oauth:"+provider+":user_info"] = userEnc
+	}
+	creds["oauth:active_provider"] = providerEnc
 	if err := atomicWriteJSON(f.credentials, creds); err != nil {
 		return fmt.Errorf("写回 credentials.json 失败: %w", err)
 	}
@@ -362,6 +463,8 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	if err := atomicWriteJSON(f.config, cfg); err != nil {
 		return fmt.Errorf("写回 config.json 失败: %w", err)
 	}
+	// config.json 现含账号 JWT / API Key，限权 0600
+	os.Chmod(f.config, 0600)
 
 	// 4. 清缓存强制重新探测
 	os.Remove(f.cache)
@@ -375,17 +478,24 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	return nil
 }
 
-// atomicWriteJSON 临时文件 + rename 原子写
+// atomicWriteJSON 临时文件 + rename 原子写（目标含账号凭证，权限收紧为 0600）
 func atomicWriteJSON(path string, v interface{}) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
 	tmp := path + ".tmp-zproxy"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Chmod(tmp, 0600); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
 }
 
 // killZCodeProcess 结束本机 ZCode 客户端进程（平台实现见 proc_windows.go / proc_other.go）
@@ -431,7 +541,12 @@ func (m *AccountManager) RestoreLocalFromSnapshot(accountID int64) error {
 			continue
 		}
 		tmp := path + ".tmp-zproxy"
-		if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
+		// 快照含账号 JWT / API Key，与切回路径同样限权 0600；
+		// 临时文件复用旧名时 WriteFile 不改既有权限，故显式 Chmod
+		if err := os.WriteFile(tmp, []byte(content), 0600); err != nil {
+			return err
+		}
+		if err := os.Chmod(tmp, 0600); err != nil {
 			return err
 		}
 		if err := os.Rename(tmp, path); err != nil {

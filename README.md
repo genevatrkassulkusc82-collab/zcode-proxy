@@ -50,16 +50,17 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 
 | 模块 | 说明 |
 |---|---|
-| 多账号管理 | 本地客户端一键导入 / OAuth 登录（手动粘贴为主，环回为实验）/ 粘贴 JWT·API Key；分组、启用策略（random / round_robin / best_quota）、状态机 |
-| 2API 网关 | `/v1/messages`（Anthropic 原生）、`/v1/chat/completions`、`/v1/responses`、`/v1/models`、`/v1/messages/count_tokens`；SSE 流式 + 用量/TTFT 记录 |
-| 额度监控 | 后台周期刷新；账号页额度条**可点开**查看分套餐槽位与逐模型额度构成；驱动状态机 |
+| 多账号管理 | 本地客户端一键导入 / OAuth 登录（免回调 CLI 轮询为主，手动粘贴备用）/ 粘贴 JWT·API Key；分组、启用策略（random / round_robin / best_quota / **priority 级联**）、状态机、**会话粘滞**（保住上游 prompt 缓存）、耗尽窗口重置时间提示 |
+| 2API 网关 | `/v1/messages`（Anthropic 原生）、`/v1/chat/completions`、`/v1/responses`、`/v1/models`、`/v1/messages/count_tokens`；SSE 流式 + 用量/TTFT 记录；上游端点按服务端 `agent/configs` 路由表自动重写（fail-open） |
+| 闲时通道 | `/async/v1/messages`（Anthropic 原生）经上游 **off-peak 免费算力队列**：取票排队、SSE 注释帧保活、`X-Off-Peak-Ticket-ID` 调用、幂等关票、票回收自动重取；设置 `async_enabled` 开启 |
+| 额度监控 | 后台周期刷新；账号页额度条**可点开**查看分套餐槽位与逐模型额度构成；驱动状态机；JWT 通道（Start Plan 计费）报耗尽而账号带 API Key 时自动交叉核对 monitor 通道（individual coding plan 额度），有余量则以 monitor 为准 |
 | 活动体系 | 检测（billing/preview）、领取（billing/claim + 阿里云无痕验证码）、激活（event/report）、**Coding Plan 配额重置**（reset/status·use·opportunity·history/read）；cron 调度 + 账号间防风控延迟 |
 | 人机验证 | go-rod 驱动**本机真实 Chrome/Edge** 无头求解；失败自动升级有头手动；参数按出口代理分组缓存 |
 | 指纹伪装 | utls 20+ 预置 ClientHello + 自定义 JA3；按主机选择传输策略 |
 | 出口代理 | 分组绑定节点（SOCKS5/HTTP CONNECT）、默认节点、全局代理、系统代理探测、端口探测、出口 IP 测试 |
 | 本地联动 | 解密 `~/.zcode/v2/credentials.json` 导入；一键切回（备份+原子写）；加密账号包 `zcb1:` 导出/导入 |
 | LLM 测试页 | 三协议 × 流式/非流式在线测试（状态/延迟/TTFT/tokens/SSE 事件数/内容/历史） |
-| 安全 | bcrypt 口令 + 登录 IP 限速退避；`sk-` Key 常数时间比较；会话 SameSite=Strict；凭证不落日志 |
+| 安全 | 首次启动随机生成口令（`ZCODE_WEB_PASS` 可覆盖，无默认口令）+ bcrypt + 登录限速退避（按 RemoteAddr）；`sk-` Key 常数时间比较；会话 SameSite=Strict；账号包导出需管理员密码二次确认；库内凭证 `vault1:` AES-256-GCM 静态加密（`ZCODE_PROXY_VAULT_SECRET` 可自定义种子，启动自动迁移存量明文）；凭证不落日志 |
 
 ## 功能详解
 
@@ -85,15 +86,15 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 
 ### 加密账号包迁移（跨机器）
 
-- 导出：选中账号 → 设置密码 → 生成 `zcb1:` 前缀的加密串（`base64(salt16‖nonce12‖ct)`，PBKDF2-SHA256 12 万轮 + AES-256-GCM），含 JWT/Key/设备指纹/快照；
+- 导出：选中账号 → 输入管理员密码确认身份 → 设置密码 → 生成 `zcb1:` 前缀的加密串（`base64(salt16‖nonce12‖ct)`，PBKDF2-SHA256 60 万轮 + AES-256-GCM，旧 12 万轮包仍可导入），含 JWT/Key/设备指纹/快照；
 - 导入：在另一台机器粘贴加密串 + 密码解密入库；密码错误直接拒绝，不落地明文。
 
 ### OAuth 登录（新账号）
 
-- 发起后打开 Z.AI 授权页；因该公开 client 仅注册 `https://zcode.z.ai/login` 回跳，**默认手动粘贴模式**：
-  授权后复制地址栏 `zcode.z.ai/login?code=…` 完整 URL 贴回网关，同步兑换并入库（失败显示具体业务码）；
+- **免回调轮询登录（默认，推荐）**：与官方桌面端相同的 CLI 轮询流程 —— `POST /api/v1/oauth/cli/init` 取授权 URL（附加桌面中转参数）→ 浏览器任意设备打开并授权（中转页在服务端记录结果，不回连本机，无需注册 redirect_uri）→ 网关轮询 `/oauth/cli/poll/{flow_id}` 自动入库；
+- 手动粘贴（备用）：复制授权后地址栏 `zcode.z.ai/login?code=…` 完整 URL 贴回网关兑换；
 - 环回模式（`127.0.0.1:8687/oauth/callback`）保留为实验项（当前会报 `Redirect URI not registered`）；
-- 兑换链：`code → Coding Plan JWT + access_token` → 自动提取 API Key（z/login → customer → api_keys → copy）→ 补查 userinfo → 入库 + 刷新额度。
+- 兑换链：`code/poll → Coding Plan JWT + access_token` → 自动提取 API Key（z/login → customer → api_keys → copy）→ 补查 userinfo → 入库 + 刷新额度。
 
 ### 活动检测 / 领取 / 激活 / 配额重置
 
@@ -104,11 +105,18 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 - **配额重置**：`coding-plan/reset/status` 查 five_hour/week 重置机会 → `reset/use {idempotency_key, reset_type}` 消耗机会恢复配额；
 - **调度**：cron 计划（分钟级去重 + per-plan 互斥 + 账号间随机延迟防风控），任务类型 detect/claim/activate/reset，运行记录可查。
 
+### 多账号路由（负载均衡 / 优先级级联 / 会话粘滞）
+
+- **负载均衡**：`round_robin`（默认）在所有可选账号间均匀轮转；`random` 随机；`best_quota` 永远挑剩余额度最大的账号。
+- **优先级级联（priority）**：账号按 priority 数值升序分层层级——**数值小者先用，层内轮转**；某层耗尽/冷却/失效时被状态机自动过滤，请求自然落到下一层，额度恢复后自动回归高层。典型用法：促销/试用账号设 50（导入后首次额度刷新发现 Start/体验 档会**自动降为 50**，仅首次生效不覆盖手动调整），自费账号保持 100。
+- **会话粘滞（sticky_sessions，默认开）**：同一会话（`metadata.user_id`，缺省按 system 块摘要）固定到同一账号，保住上游 prompt 缓存（缓存命中远便宜于 fresh）；粘滞账号进入不可选状态自动让位，恢复后回归。TTL 1 小时。
+- **耗尽重置提示**：monitor 通道的重置时间落库后，全部账号耗尽的 503 会附「额度窗口约 N 分钟后重置」；额度构成弹窗展示双通道（Start Plan 计费 vs coding plan monitor）并排视图。
+
 ### 额度监控与构成弹窗
 
 - 后台按 `quota_refresh_interval` 周期刷新（0=关闭）；成功后节流 30s 防惊群；
 - 账号页额度条**可点击**：弹窗展示分套餐槽位（plan_id/档位/状态/到期/进度）与逐模型明细（总额/已用/剩余/占比/周期）；
-- 额度驱动状态机：耗尽→exhausted、限流→cooling、鉴权失败→invalid（刷新鉴权通过可自动恢复）、无订阅→inactive。
+- 额度驱动状态机：耗尽→exhausted、限流→cooling、鉴权失败→invalid（后台按退避自动重试，鉴权恢复即自动复活）、无订阅→inactive。
 
 ### 2API 网关与协议转换
 
@@ -159,14 +167,14 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 ## 2. `/v1/messages` 请求生命周期
 
 1. **鉴权**：`x-api-key` 或 `Authorization: Bearer` → 与 DB `settings.api_key` 做 `subtle.ConstantTimeCompare`。
-2. **规范化**：模型名大小写/前缀映射（`glm-5.3`→`GLM-5.3`、`bigmodel/x`→provider 路由）；GLM-5.3 强制注入 `thinking{type:enabled,budget}` + `reasoning_effort:max`（上游不允许禁思考）；string content 桥接为 `[{type:text}]`；body 上限 8MB。
+2. **规范化**：模型名大小写/前缀映射（`glm-5.3`→`GLM-5.3`、`bigmodel/x`→provider 路由）；GLM-5.3 思考归一化为上游现行格式（对齐 zai-org/ZCode 3.14.x）：思考开启 → `{thinking:{type:adaptive},output_config:{effort:low|high|max}}`（由 budget_tokens/reasoning_effort 映射），未请求思考 → `{thinking:{type:disabled}}`；string content 桥接为 `[{type:text}]`；body 上限 8MB。
 3. **选号**：`AccountPool.Select(provider, group, skip)` 按策略（round_robin 游标 / random / best_quota）过滤 `enabled && 状态可选 && 有凭证`；冷却中账号到期自动可选。
 4. **降级链**（每账号）：
-   - 路径1 `JWT + X-Aliyun-Captcha-Verify-Param` → `zcode.z.ai/.../anthropic/v1/messages`（验证码被拒则失效缓存重解，最多 3 次）；
+   - 路径1 `JWT + X-Aliyun-Captcha-Verify-Param` → `zcode.z.ai/.../anthropic/v1/messages`（验证码被拒则失效缓存重解，最多 3 次；无验证码参数（mode=off 或求解失败）时跳过）；
    - 路径2 `JWT 直连`（上游放宽时零延迟）；
    - 路径3 `x-api-key` → `api.z.ai/api/anthropic/v1/messages`（无需验证码）。
-5. **上游错误分类**：`401/403→invalid`；`429→请求内退避重试一次(尊重 Retry-After≤5s)，仍失败 cooling 30s`；`402/余额短语→exhausted`；`3012 unusual activity→风控，试其余路径，全败 cooling`；`3xx→cooling(WAF 挑战)`；`2xx 但非 json/sse→cooling`；其余原样回传。
-6. **成功**：`MarkUsed`（cooling/exhausted 复活为 active）+ 节流额度刷新（30s）+ 流式透传/转换 + SSE 嗅探写 `usage_records`（含 TTFT）。
+5. **上游错误分类**：`401/403→invalid`；`429→请求内退避重试一次(尊重 Retry-After≤5s)，仍失败 cooling 30s`；`402/余额短语→exhausted`；`3012 unusual activity→风控，试其余路径，全败 cooling`；`3xx→cooling(WAF 挑战)`；`2xx 但非 json/sse→cooling`；其余原样回传。挑战页（3xx / 2xx 非 JSON/SSE）返回客户端时统一为 `502`，不伪装 200。
+6. **成功**：`MarkUsed`（记录使用；cooling 到期后自动重新可选，exhausted 仅由额度刷新确认有余量后恢复）+ 节流额度刷新（30s，进程内单飞）+ 流式透传/转换 + SSE 嗅探写 `usage_records`（含 TTFT）。
 7. **全败**：503 `no_available_account`，若因冷却则附「约 N 秒后自动恢复」与最近失败原因链。
 
 ## 3. 并发与锁模型
@@ -175,8 +183,8 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 |---|---|---|
 | `pool.rotation` (mutex) | 选号游标 | round_robin 按 `group|provider` 递增 |
 | `claimLocks[id]` (per-account mutex, TryLock) | 领取/重置 | UI 手动与 cron 并发不双领/双重置 |
-| `solveSem` (cap-1 chan) | 验证码 | 全局唯一求解；后台刷新用非阻塞 TryAcquire，**无锁泄漏路径** |
-| `execLocks[planId]` (per-plan mutex, TryLock) | cron | 长计划不排队堆积，拿不到锁跳过本 tick |
+| `groupSem` (per-proxy-group cap-1 chan) | 验证码 | 按出口代理分组唯一求解，前台等待 45s 上限；后台刷新用非阻塞 TryAcquire，**无锁泄漏路径** |
+| `execLocks[planId]` (per-plan mutex, TryLock) | cron | 长计划不排队堆积，cron 拿不到锁跳过本 tick；手动运行拿不到锁报「计划正在执行中」 |
 | `clientCache` (sync.Map) | HTTP 客户端 | 键 `(proxy, 指纹, JA3, timeout, 是否zcode)`；设置变更 `CloseIdleClients()` |
 | SQLite `MaxOpenConns(1)` + WAL | 存储 | 单写串行，busy_timeout 5s |
 
@@ -200,8 +208,8 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 |---|---|---|
 | 消息（免费通道） | `POST zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages` | Bearer JWT + 验证码头 |
 | 消息（Key 通道） | `POST api.z.ai/api/anthropic/v1/messages` | `x-api-key` |
-| 额度 | `GET zcode.z.ai/api/v1/zcode-plan/billing/current|balance?app_version=` | Bearer JWT |
-| Key 通道额度 | `GET api.z.ai/api/monitor/usage/quota/limit` + `/api/biz/subscription/list` | Bearer key |
+| 额度 | `GET zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=`（现行端点；`billing/current` 已废弃仅兜底） | Bearer JWT |
+| Key 通道额度 | `GET api.z.ai/api/monitor/usage/quota/limit` + `/api/biz/subscription/list` | Authorization 直传 Key（无 Bearer 前缀，对齐官方客户端） |
 | 活动预览 | `GET zcode.z.ai/api/v1/zcode-plan/billing/preview?app_version&platform` | Bearer JWT |
 | 领取 | `POST zcode.z.ai/api/v1/zcode-plan/billing/claim` `{plan_id}` | Bearer JWT + 验证码头 |
 | 激活 | `POST zcode.z.ai/api/v1/event/report`（app_launch + app_daily_active） | Bearer JWT |
@@ -213,7 +221,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 ### 5.2 请求头（与官方客户端一致）
 
 身份头：`User-Agent: ZCode/{ver}`、`X-ZCode-App-Version`、`X-Title: Z Code@electron`、`X-Platform: win32-x64`、`X-Release-Channel: stable`、`X-Client-Language`(Intl locale)、`X-Client-Timezone`(Intl tz)、`X-Os-Category`(win32→windows)、`X-Os-Version`(10.0.build)、`X-Device-Mid`(telemetry-state.json)、`x-request-id`(uuid)。
-消息通道追加：`anthropic-version: 2023-06-01`、`X-ZCode-Agent: glm`、`HTTP-Referer: https://zcode.z.ai`、`X-Aliyun-Captcha-Verify-Param`(+Region)。
+消息通道追加：`anthropic-version: 2023-06-01`、`X-ZCode-Agent: glm`、`HTTP-Referer: https://zcode.z.ai`、`X-Aliyun-Captcha-Verify-Param`(+Region)（注：官方客户端 3.14.x 已移除模型请求验证码，该头仅在 `client/configs` 报告 captcha.enabled 时发送）。
 
 ### 5.3 错误码语义
 
@@ -232,12 +240,14 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 ## 6. SSE / 协议转换
 
 - **Anthropic→OpenAI chat**：`message_start→首 chunk(role)`、`content_block_delta.text_delta→delta.content`、`thinking_delta→delta.reasoning_content`、`tool_use→delta.tool_calls[index]`、`message_delta→finish_reason`、末尾 `usage chunk(include_usage)` + `[DONE]`。
-- **Anthropic→Responses**：`response.created/output_item.added/content_part.added/output_text.delta/function_call_arguments.delta/output_text.done/output_item.done/response.completed`；错误/断流发 `response.failed`。
-- **OpenAI→Anthropic 请求**：system/developer→`system` 串；tool→`tool_result`；assistant.tool_calls→`tool_use`；image_url(data:)→base64 image；tool_choice auto/required/name 映射。
+- **Anthropic→Responses**：`response.created/output_item.added/reasoning_summary_part.added/reasoning_summary_text.delta/reasoning_summary_text.done/reasoning_summary_part.done/content_part.added/output_text.delta/function_call_arguments.delta/output_text.done/output_item.done/response.completed`（思考以 `type:reasoning` 输出项流式发出，`response.completed.output` 与事件序列一致）；错误/断流发 `response.failed`。
+- **OpenAI→Anthropic 请求**：system/developer→`system` 串；tool→`tool_result`；assistant.tool_calls→`tool_use`；image_url 仅接受 data: base64（其余形态返回 400，不静默丢弃）；tool_choice auto/required/name 映射。reasoning_effort 透传至 GLM-5.3 思考档位，非 5.3 模型丢弃。
 - **Responses→Anthropic**：instructions→system；input[] 的 message/function_call/function_call_output 映射；reasoning.effort→reasoning_effort。
-- **健壮性**：SSE 解析缓冲上限 16MB、跨 chunk 断帧兼容 LF/CRLF；`event:error` 与 `err!=io.EOF` 均按失败处理（不伪装成功）。
+- **健壮性**：SSE 解析缓冲上限 16MB（超限按流失败处理，不静默清空）、跨 chunk 断帧兼容 LF/CRLF；命名 `event:error`、匿名 `data:` 错误帧（顶层 `error` 字段或 `type=error`）与 `err!=io.EOF` 均按失败处理（不伪装成功）。
 
 ## 7. 验证码子系统（阿里云无痕）
+
+> 官方客户端自 3.14.3 起源码中已无任何验证码逻辑（模型请求免验证），本子系统仅在 `client/configs` 报告 `captcha.enabled` 时参与请求，否则自动跳过；保留用于领取等仍可能触发的场景。
 
 - 配置：`client/configs` → `{enabled,prefix,region,sceneId}`，缓存 10min。
 - 求解：rod 启动**本机真实 Chrome/Edge**（捆绑 Chromium 会被风控识别），先访问 `zcode.z.ai` 建立同源，注入 SDK HTML（配置值经 JSON 转义防注入），`startTracelessVerification` → `__onCaptcha` 回调捕获 param；持久化 user-data-dir 保留风控 cookie。
@@ -260,7 +270,9 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 ## 10. 配置参考
 
 `config/config.json`（首次运行生成）：`listen_addr`、`app_version`(空=注册表探测)、`models[]`、`upstream{zai,zai_fallback,bigmodel}`。
-`settings`（界面/`PUT /api/settings`）：`selection_strategy`、`quota_refresh_interval`(0=关闭)、`upstream_proxy`、`fingerprint`、`custom_ja3`、`captcha_mode`(auto/manual/off)、`gateway_models`、`api_key`、`password_hash`(bcrypt)。
+`settings`（界面/`PUT /api/settings`）：`selection_strategy`、`quota_refresh_interval`(0=关闭)、`upstream_proxy`、`fingerprint`、`custom_ja3`、`captcha_mode`(auto/manual/off)、`gateway_models`、`api_key`、`password_hash`(bcrypt)、`async_enabled`(闲时通道开关)、`async_poll_interval_ms`、`async_keepalive_ms`、`async_max_retries`、`async_max_wait_sec`、`sticky_sessions`(会话粘滞，默认开)。
+
+账号 `priority` 字段：priority 策略下数值小者先用（1-9999，默认 100；导入后首次额度刷新发现促销档自动降为 50）。
 
 ## 11. 管理 API（节选，session 鉴权）
 
@@ -280,7 +292,12 @@ go vet .
 - utls v1.8.2 无法表达 PQ 曲线 4588 与新 ALPS id（17613），自定义 JA3 的 key_share 仅 X25519；
 - OAuth 环回 redirect_uri 未被 Z.AI 注册（`Redirect URI not registered`），默认手动粘贴模式；
 - 多出口代理下验证码参数按代理分组缓存，跨组不共享；
-- `/v1/messages/count_tokens` 为保守估算（字符/4+开销）。
+- `/v1/messages/count_tokens` 为保守估算（字符/4+开销；官方客户端 3.14.x 已不调用该端点，仅为兼容保留）。
+- GLM-5.3 思考参数对上游按官方 3.14.x wire 格式发送（`thinking:{type:adaptive}` + `output_config.effort`）；上游若回退旧版可能需重新调整。
+- 账号包导出使用 PBKDF2 60 万轮；旧 12 万轮加密包仅支持导入（自动回退），不再生成。
+- 库内凭证已静态加密（`vault1:` AES-256-GCM），密钥默认为随机生成的 `data/vault.key`（0600，首次启动创建）。**`vault.key` 必须与 `data/` 一同备份：丢失即库内凭证永久不可读**；跨机器迁移可改用 `ZCODE_PROXY_VAULT_SECRET` 指定种子（同样需妥善保管，env 模式不在磁盘留钥）。启动时自动迁移存量明文；注意迁移前的明文可能残留在 WAL/空闲页，敏感场景请迁移后执行 `VACUUM`。
+- `/async/v1/messages` 闲时通道为一次性应答、无会话记忆（上游语义）；多轮对话请在请求内携带历史。
+- 闲时通道（off-peak）：取票/排队/就绪/转发全链路已打通，但上游对消息转发返回 `3001 parameter error`（已对齐 stream 强制、x-coding-plan-api-key、metadata.user_id、小写模型、cache_control 等全部已知协议面）；疑似上游对账号状态或新版本有额外校验，待上游行为明确。
 
 ## 仓库与数据边界
 

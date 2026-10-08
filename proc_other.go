@@ -4,11 +4,19 @@ package main
 
 import (
 	"os/exec"
+	"runtime"
 )
 
-// killProcessByName 非 Windows: pkill
+// killProcessByName 非 Windows: pkill。
+// 目标按平台区分：macOS 桌面客户端是 ZCode.app/Contents/MacOS/ZCode（无 .exe），
+// 直接匹配 "ZCode.exe" 在 macOS 上永远扑空——用 "ZCode.app" 锁定应用包，
+// 避免误伤其他含 ZCode 字样的命令行。
 func killProcessByName(name string) (string, error) {
-	out, err := exec.Command("pkill", "-f", name).CombinedOutput()
+	target := name
+	if runtime.GOOS == "darwin" {
+		target = "ZCode.app"
+	}
+	out, err := exec.Command("pkill", "-f", target).CombinedOutput()
 	return string(out), err
 }
 

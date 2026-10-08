@@ -24,3 +24,13 @@ refs/
 Thumbs.db
 .idea/
 .vscode/
+
+# 本机运行时（启动脚本/密钥/二进制，不入库）
+run.sh
+.secrets.env
+zcode-proxy
+connect-zcode.sh
+.agents/
+
+# review worktree (isolated session)
+.worktrees/
