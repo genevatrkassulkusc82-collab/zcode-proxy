@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -64,11 +63,6 @@ func (e *EgressProxy) ProxyURLForAccount(a *Account) string {
 func (e *EgressProxy) GlobalProxyURL() string {
 	v, _ := e.db.GetSetting("upstream_proxy")
 	return strings.TrimSpace(v)
-}
-
-// HTTPClientForAccount 按账号组构造 HTTP 客户端
-func (e *EgressProxy) HTTPClientForAccount(a *Account, timeout time.Duration) *http.Client {
-	return NewUpstreamHTTPClient(e.ProxyURLForAccount(a), timeout)
 }
 
 // ---- 健康测试：出口 IP ----
@@ -156,8 +150,13 @@ func DetectSystemProxy() (enabled bool, proxyURL string) {
 			server = parts["http"]
 		}
 		if server == "" {
-			for _, v := range parts {
+			for k, v := range parts {
 				server = v
+				// 仅 socks= 时按 SOCKS 语义回填 scheme：标成 http:// 会把
+				// CONNECT 字节打到 SOCKS 端口，用户存下的建议值必然失败
+				if k == "socks" {
+					server = "socks5://" + v
+				}
 				break
 			}
 		}
