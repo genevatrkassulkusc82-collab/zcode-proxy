@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,22 +36,24 @@ type ResetUsed struct {
 
 // ResetStatus 重置状态
 type ResetStatus struct {
-	AvailableFiveHourResets  []ResetSlot `json:"available_five_hour_resets"`
-	AvailableWeekResets      []ResetSlot `json:"available_week_resets"`
-	LatestFiveHourReset      *ResetUsed  `json:"latest_five_hour_reset_history"`
-	LatestWeekReset          *ResetUsed  `json:"latest_week_reset_history"`
-	HasUnreadHistory         bool        `json:"has_unread_history"`
+	AvailableFiveHourResets []ResetSlot `json:"available_five_hour_resets"`
+	AvailableWeekResets     []ResetSlot `json:"available_week_resets"`
+	LatestFiveHourReset     *ResetUsed  `json:"latest_five_hour_reset_history"`
+	LatestWeekReset         *ResetUsed  `json:"latest_week_reset_history"`
+	HasUnreadHistory        bool        `json:"has_unread_history"`
 }
 
-// resetHeaders AC() 移植：双凭证 + 团队上下文
+// resetHeaders AC() 移植：双凭证 + 团队上下文。
+// 凭证走锁保护快照：本副本可能同时被刷新 goroutine setCredentials 改写
 func (z *ZCodeAPI) resetHeaders(a *Account) map[string]string {
+	jwt, apiKey, _ := a.credentialSnapshot()
 	h := map[string]string{
-		"Authorization": "Bearer " + a.ZCodeJWT,
+		"Authorization": "Bearer " + jwt,
 		"User-Agent":    "ZCode/" + z.appVersion,
 		"accept":        "application/json",
 	}
-	if a.APIKey != "" {
-		h["X-Bigmodel-Authorization"] = a.APIKey
+	if apiKey != "" {
+		h["X-Bigmodel-Authorization"] = apiKey
 	}
 	// 团队上下文：账号备注/分组中以 team:orgId:projId 形式声明时启用
 	if org, proj, ok := parseTeamContext(a); ok {
@@ -105,9 +109,48 @@ func (z *ZCodeAPI) resetRequest(a *Account, method, path string, body map[string
 	return v, resp.StatusCode, nil
 }
 
+// errResetTransport reset/use 请求未收到可解析响应（网络超时/连接中断）：
+// 上游可能已受理消耗。调用方据此在账本里如实标注"槽位可能已被消耗"，
+// 而不是留一条误导性的纯失败记录
+var errResetTransport = errors.New("reset response not received")
+
+// resetSlotMsWarned expire_at 毫秒量纲告警去重（每进程一次）
+var resetSlotMsWarned sync.Once
+
+// normalizeResetSlotUnits 归一 expire_at 量纲。单位已实证为毫秒：ZCode 客户端
+// app.asar 的重置状态机 vpt() 把 expireAt 与 Date.now()（毫秒）直接比较，
+// used_at 亦为毫秒（SyncResetHistoryFromUpstream 按 /1000 去重，prod live 验证）。
+// 本网关的时间数学全用 epoch 秒，故 >1e11（秒级 epoch 到公元 5138 年也到不了）
+// 的值按毫秒归一。若某日出现秒级值，说明上游改了线格式——告警一次
+func normalizeResetSlotUnits(st *ResetStatus) {
+	if st == nil {
+		return
+	}
+	const secEpochCeil = int64(100_000_000_000)
+	hit := false
+	for i := range st.AvailableFiveHourResets {
+		if st.AvailableFiveHourResets[i].ExpireAt > secEpochCeil {
+			st.AvailableFiveHourResets[i].ExpireAt /= 1000
+			hit = true
+		}
+	}
+	for i := range st.AvailableWeekResets {
+		if st.AvailableWeekResets[i].ExpireAt > secEpochCeil {
+			st.AvailableWeekResets[i].ExpireAt /= 1000
+			hit = true
+		}
+	}
+	if hit {
+		resetSlotMsWarned.Do(func() {
+			log.Printf("[reset] expire_at normalized from milliseconds (confirmed upstream unit, per ZCode client app.asar)")
+		})
+	}
+}
+
 // FetchResetStatus GET reset/status
 func (z *ZCodeAPI) FetchResetStatus(a *Account) (*ResetStatus, int, string, error) {
-	if a.ZCodeJWT == "" {
+	// 锁保护读：本副本可能正被并发刷新 goroutine setCredentials 改写
+	if jwt, _, _ := a.credentialSnapshot(); jwt == "" {
 		return nil, 0, "", fmt.Errorf("需要 ZCode JWT")
 	}
 	v, status, err := z.resetRequest(a, "GET", "/status", nil)
@@ -125,18 +168,25 @@ func (z *ZCodeAPI) FetchResetStatus(a *Account) (*ResetStatus, int, string, erro
 	raw, _ := json.Marshal(data)
 	var st ResetStatus
 	json.Unmarshal(raw, &st)
+	normalizeResetSlotUnits(&st)
 	return &st, status, "", nil
 }
 
 // UseReset POST reset/use {idempotency_key, reset_type}
-func (z *ZCodeAPI) UseReset(a *Account, resetType string) (bool, int64, string, error) {
+// idemKeys 可选：自动路径传确定性键（账号+槽位到期时间），同一槽位的重试/
+// 进程重启重放携带同键，上游幂等去重有机会拦截同槽双花；不传则每次随机
+// （手动路径保持随机，避免把不同时刻的手动重置误判为重放）
+func (z *ZCodeAPI) UseReset(a *Account, resetType string, idemKeys ...string) (bool, int64, string, error) {
 	idem := uuid.NewString()
+	if len(idemKeys) > 0 && idemKeys[0] != "" {
+		idem = idemKeys[0]
+	}
 	v, _, err := z.resetRequest(a, "POST", "/use", map[string]interface{}{
 		"idempotency_key": idem,
 		"reset_type":      resetType,
 	})
 	if err != nil {
-		return false, 0, "", err
+		return false, 0, "", fmt.Errorf("%w: %v", errResetTransport, err)
 	}
 	code := jsonInt(v, "code")
 	msg := firstNonEmpty(jsonStr(v, "msg"), jsonStr(v, "message"))
@@ -144,40 +194,19 @@ func (z *ZCodeAPI) UseReset(a *Account, resetType string) (bool, int64, string, 
 		return false, 0, msg, fmt.Errorf("业务码 %d: %s", code, msg)
 	}
 	data, _ := v["data"].(map[string]interface{})
-	used := false
 	if d, ok := data["used"].(bool); ok {
-		used = d
-	}
-	return used, 0, msg, nil
-}
-
-// RequestResetOpportunity POST reset/opportunity（3301=机会授予）
-func (z *ZCodeAPI) RequestResetOpportunity(a *Account) (granted bool, nextTry int64, msg string, err error) {
-	idem := uuid.NewString()
-	v, status, err := z.resetRequest(a, "POST", "/opportunity", map[string]interface{}{
-		"idempotency_key": idem,
-	})
-	if err != nil {
-		return false, 0, "", err
-	}
-	if status == 429 {
-		return false, 0, "重置机会请求被限流", fmt.Errorf("HTTP 429 throttled")
-	}
-	code := jsonInt(v, "code")
-	data, _ := v["data"].(map[string]interface{})
-	if d, ok := data["granted"].(bool); ok && d {
-		return true, 0, firstNonEmpty(jsonStr(v, "msg"), "机会已授予"), nil
-	}
-	if d, ok := data["granted"].(bool); ok && !d {
-		if n := jsonNum(data, "next_try_at"); n != nil {
-			return false, int64(*n) * 1000, "机会未授予", nil
+		if d {
+			// 防双花盖印：无归属（0）跟随每一次成功消耗——手动/阈值路径不经过
+			// spendExpiringSlotGuarded，不盖印会让临期路径把同一槽位再花一次
+			markExpirySpend(a.ID, 0)
 		}
-		return false, 0, "机会未授予", nil
+		return d, 0, msg, nil
 	}
-	if code == 3301 {
-		return true, 0, "机会已授予（3301）", nil
-	}
-	return false, 0, firstNonEmpty(jsonStr(v, "msg"), jsonStr(v, "message")), fmt.Errorf("业务码 %d", code)
+	// 业务码 0 但响应未带 used 字段（响应形状逆向自 app.asar，无法保证该字段）：
+	// 视为已消耗并告警——按失败记录会诱导上层重复消耗一次真实重置机会
+	log.Printf("[reset] use %s: code=0 but data.used missing (msg=%q); treating as consumed", resetType, msg)
+	markExpirySpend(a.ID, 0)
+	return true, 0, msg, nil
 }
 
 // ResetForAccount 组合流程：查状态 → 选 five_hour 优先否则 week → use → 刷新额度 → 落记录。
@@ -192,6 +221,7 @@ func (z *ZCodeAPI) ResetForAccount(a *Account) *ClaimResult {
 }
 
 func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
+	// UsedAt 在成功时精确落执行时刻（见下方成功分支），供同步去重精确匹配
 	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "reset"}
 	st, _, bizMsg, err := z.FetchResetStatus(a)
 	if err != nil {
@@ -199,39 +229,46 @@ func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
 		if bizMsg != "" {
 			record.Message = bizMsg
 		}
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[reset] insert claim record: %v", err)
+		}
 		return &ClaimResult{Code: -1, Message: record.Message}
 	}
 	resetType := ""
 	switch {
 	case len(st.AvailableFiveHourResets) > 0:
-		resetType = "five_hour"
+		resetType = "FIVE_HOUR"
 	case len(st.AvailableWeekResets) > 0:
-		resetType = "week"
+		resetType = "WEEK"
 	}
 	if resetType == "" {
 		record.Success = true
 		record.Message = "无可用重置机会（five_hour/week 均已用完）"
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[reset] insert claim record: %v", err)
+		}
 		return &ClaimResult{OK: true, Message: record.Message}
 	}
 	used, _, msg, err := z.UseReset(a, resetType)
 	if err != nil || !used {
 		record.Message = fmt.Sprintf("重置执行失败(%s): %v %s", resetType, err, msg)
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[reset] insert claim record: %v", err)
+		}
 		z.db.SetAccountClaimResult(a.ID, "配额重置", record.Message)
 		return &ClaimResult{Code: -1, Message: record.Message}
 	}
 	record.Success = true
 	record.PlanName = "配额重置(" + resetType + ")"
 	record.Message = "重置成功，配额已恢复"
+	record.UsedAt = time.Now().Unix() // 同步去重走精确匹配（localtime 墙钟回退在 DST 期会漂移）
 	z.db.InsertClaimRecord(record)
 	z.db.SetAccountClaimResult(a.ID, record.PlanName, record.Message)
 	log.Printf("[reset] account %s quota reset via %s", a.Email, resetType)
-	go func() {
+	z.goBackground("reset-quota-refresh", func() {
 		time.Sleep(2 * time.Second)
 		z.RefreshAccountQuota(a)
-	}()
+	})
 	return &ClaimResult{OK: true, PlanName: record.PlanName, Message: record.Message}
 }
 
@@ -267,8 +304,8 @@ func (z *ZCodeAPI) SyncModelCatalog() ([]CatalogModel, error) {
 		Data struct {
 			BuiltinModels []CatalogModel `json:"builtinModels"`
 			Providers     []struct {
-				ID      string `json:"id"`
-				BaseURL string `json:"baseUrl"`
+				ID      string         `json:"id"`
+				BaseURL string         `json:"baseUrl"`
 				Models  []CatalogModel `json:"models"`
 			} `json:"providers"`
 		} `json:"data"`
@@ -311,4 +348,97 @@ func (z *ZCodeAPI) GetModelCatalog() []CatalogModel {
 	var out []CatalogModel
 	json.Unmarshal([]byte(raw), &out)
 	return out
+}
+
+// resetHistorySyncInterval 单账号上游重置历史同步最小间隔（防风控）
+const resetHistorySyncInterval = 10 * time.Minute
+
+// SyncResetHistoryFromUpstream 拉取上游 reset/status 的 latest_*_reset_history，
+// 把非本网关执行的重置（官方客户端、其他设备等）补记到 claim_records，
+// 使重置历史与真实一致。used_at 为毫秒时间戳；
+// 去重：本地 ±15 分钟内已有成功重置记录则不重复入库；锚点存 settings。
+func (z *ZCodeAPI) SyncResetHistoryFromUpstream(a *Account) (int, error) {
+	if a == nil || a.ZCodeJWT == "" {
+		return 0, nil
+	}
+	z.resetSyncMu.Lock()
+	if last, ok := z.resetSyncAt[a.ID]; ok && time.Since(last) < resetHistorySyncInterval {
+		z.resetSyncMu.Unlock()
+		return 0, nil
+	}
+	z.resetSyncAt[a.ID] = time.Now()
+	z.resetSyncMu.Unlock()
+
+	st, _, _, err := z.FetchResetStatus(a)
+	if err != nil {
+		return 0, err
+	}
+	type slot struct {
+		kind string
+		used int64 // 毫秒
+	}
+	var latest []slot
+	if st.LatestFiveHourReset != nil && st.LatestFiveHourReset.UsedAt > 0 {
+		latest = append(latest, slot{"FIVE_HOUR", st.LatestFiveHourReset.UsedAt})
+	}
+	if st.LatestWeekReset != nil && st.LatestWeekReset.UsedAt > 0 {
+		latest = append(latest, slot{"WEEK", st.LatestWeekReset.UsedAt})
+	}
+
+	anchorKey := fmt.Sprintf("reset_history_seen:%d", a.ID)
+	anchor := map[string]int64{}
+	if raw, err := z.db.GetSetting(anchorKey); err == nil && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &anchor)
+	}
+
+	// 与 UseReset 本地落记录互斥（同一把账号级锁）：关闭"上游已接受重置、
+	// 本地尚未落记录"亚秒窗口内同步读到新 used_at 造成重复入库的竞态。
+	// 非阻塞 TryLock：本函数跑在池子的 4-worker 额度刷新信号量上，而同一把锁
+	// 会被整段领取流程持有（含验证码求解，可达数十秒）——阻塞等锁会把刷新
+	// worker 全部停摆、拖死 60s 刷新轮。同步按账号节流，本轮跳过下轮再来
+	mu := z.claimLockFor(a.ID)
+	if !mu.TryLock() {
+		log.Printf("[reset] account %s claim lock busy, skipping reset-history sync this round", a.Email)
+		return 0, nil
+	}
+	defer mu.Unlock()
+
+	inserted := 0
+	changed := false
+	for _, e := range latest {
+		if e.used/1000 <= anchor[e.kind]/1000 {
+			continue
+		}
+		dup, err := z.db.HasResetRecordNear(a.ID, e.used/1000, e.kind)
+		if err != nil {
+			continue // 查询失败不推进锚点，下次同步重试
+		}
+		if !dup {
+			if err := z.db.InsertClaimRecord(&ClaimRecord{
+				AccountID: a.ID,
+				Email:     a.Email,
+				TaskType:  "reset",
+				PlanName:  "配额重置(" + e.kind + ")",
+				Success:   true,
+				Message:   "上游重置记录（非本网关执行）",
+				UsedAt:    e.used / 1000, // 精确去重锚点（epoch 秒）
+			}); err != nil {
+				// 入库失败不推进锚点：下轮同步重试，否则该记录永久丢失
+				log.Printf("[reset] insert upstream reset record %s account=%s: %v", e.kind, a.Email, err)
+				continue
+			}
+			inserted++
+		}
+		anchor[e.kind] = e.used
+		changed = true
+	}
+	if changed {
+		if raw, err := json.Marshal(anchor); err == nil {
+			z.db.SetSetting(anchorKey, string(raw))
+		}
+	}
+	// 临期槽位 use-it-or-lose-it：同一把 claim 锁内评估非耗尽账号的
+	// 到期重置机会（MaybeAutoReset 只有 402 触发点，盖不住它们）
+	z.spendExpiringResetForSync(a, st)
+	return inserted, nil
 }
